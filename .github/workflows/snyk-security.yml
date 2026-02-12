@@ -1,0 +1,259 @@
+name: Snyk Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Project language: java or node'
+        required: true
+        type: string
+      java-version:
+        description: 'Java version (only for language=java)'
+        required: false
+        type: string
+        default: '21'
+      java-distribution:
+        description: 'Java distribution (only for language=java)'
+        required: false
+        type: string
+        default: 'corretto'
+      node-version:
+        description: 'Node.js version (only for language=node)'
+        required: false
+        type: string
+        default: '20'
+      snyk-org:
+        description: 'Snyk organization ID'
+        required: false
+        type: string
+        default: 'sale-ads'
+      severity-threshold:
+        description: 'Minimum severity to report: low|medium|high|critical'
+        required: false
+        type: string
+        default: 'high'
+      scan-open-source:
+        description: 'Run Snyk Open Source (dependency) scan'
+        required: false
+        type: boolean
+        default: true
+      scan-code:
+        description: 'Run Snyk Code (SAST) scan'
+        required: false
+        type: boolean
+        default: true
+      scan-container:
+        description: 'Run Snyk Container scan'
+        required: false
+        type: boolean
+        default: true
+      scan-iac:
+        description: 'Run Snyk IaC scan'
+        required: false
+        type: boolean
+        default: false
+      docker-image-name:
+        description: 'Docker image name for container scanning'
+        required: false
+        type: string
+        default: ''
+      dockerfile-path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: './Dockerfile'
+      continue-on-error:
+        description: 'If true, scan failures do not fail the workflow (report-only mode)'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      snyk-token:
+        description: 'Snyk API token'
+        required: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # ============================================================
+  # JOB 1: Snyk Open Source (Dependency Vulnerability Scanning)
+  # ============================================================
+  snyk-open-source:
+    name: Snyk Open Source
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-open-source }}
+    continue-on-error: ${{ inputs.continue-on-error }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        if: ${{ inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: maven
+
+      - name: Build Java project for dependency resolution
+        if: ${{ inputs.language == 'java' }}
+        run: ./mvnw install -DskipTests -q
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install Node.js dependencies
+        if: ${{ inputs.language == 'node' }}
+        run: npm ci
+
+      - name: Run Snyk Open Source scan
+        uses: snyk/actions/node@master
+        continue-on-error: ${{ inputs.continue-on-error }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          command: test
+          args: >-
+            --severity-threshold=${{ inputs.severity-threshold }}
+            --org=${{ inputs.snyk-org }}
+            --sarif-file-output=snyk-opensource.sarif
+
+      - name: Upload Snyk Open Source SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-opensource.sarif
+          category: snyk-open-source
+        continue-on-error: true
+
+  # ============================================================
+  # JOB 2: Snyk Code (SAST)
+  # ============================================================
+  snyk-code:
+    name: Snyk Code (SAST)
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-code }}
+    continue-on-error: ${{ inputs.continue-on-error }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Snyk Code scan
+        uses: snyk/actions/node@master
+        continue-on-error: ${{ inputs.continue-on-error }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          command: code test
+          args: >-
+            --org=${{ inputs.snyk-org }}
+            --sarif-file-output=snyk-code.sarif
+
+      - name: Upload Snyk Code SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+        continue-on-error: true
+
+  # ============================================================
+  # JOB 3: Snyk Container (Docker Image Scanning)
+  # ============================================================
+  snyk-container:
+    name: Snyk Container
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-container && inputs.docker-image-name != '' }}
+    continue-on-error: ${{ inputs.continue-on-error }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        if: ${{ inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: maven
+
+      - name: Build Java artifact
+        if: ${{ inputs.language == 'java' }}
+        run: ./mvnw package -DskipTests -q
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install Node.js dependencies
+        if: ${{ inputs.language == 'node' }}
+        run: npm ci
+
+      - name: Build Docker image for scanning
+        run: |
+          docker build \
+            -t ${{ inputs.docker-image-name }}:snyk-scan \
+            -f ${{ inputs.dockerfile-path }} \
+            .
+
+      - name: Run Snyk Container scan
+        uses: snyk/actions/docker@master
+        continue-on-error: ${{ inputs.continue-on-error }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          image: ${{ inputs.docker-image-name }}:snyk-scan
+          args: >-
+            --severity-threshold=${{ inputs.severity-threshold }}
+            --org=${{ inputs.snyk-org }}
+            --file=${{ inputs.dockerfile-path }}
+            --exclude-app-vulns
+
+      - name: Upload Snyk Container SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-container
+        continue-on-error: true
+
+  # ============================================================
+  # JOB 4: Snyk IaC (Infrastructure as Code)
+  # ============================================================
+  snyk-iac:
+    name: Snyk IaC
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-iac }}
+    continue-on-error: ${{ inputs.continue-on-error }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Snyk IaC scan
+        uses: snyk/actions/iac@master
+        continue-on-error: ${{ inputs.continue-on-error }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          args: >-
+            --severity-threshold=${{ inputs.severity-threshold }}
+            --org=${{ inputs.snyk-org }}
+            --sarif-file-output=snyk-iac.sarif
+
+      - name: Upload Snyk IaC SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-iac.sarif
+          category: snyk-iac
+        continue-on-error: true
