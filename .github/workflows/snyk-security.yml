@@ -23,10 +23,10 @@ on:
         type: string
         default: '20'
       snyk-org:
-        description: 'Snyk organization ID'
+        description: 'Snyk organization slug'
         required: false
         type: string
-        default: 'sale-ads'
+        default: 'sa-backdev'
       severity-threshold:
         description: 'Minimum severity to report: low|medium|high|critical'
         required: false
