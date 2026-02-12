@@ -72,10 +72,8 @@ on:
         description: 'Snyk API token'
         required: false
 
-permissions:
-  contents: read
-  security-events: write
-  actions: read
+# NOTE: permissions are set by caller workflows, not here.
+# Callers must declare: permissions: { contents: read, security-events: write, actions: read }
 
 jobs:
   # ============================================================
