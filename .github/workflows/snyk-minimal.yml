@@ -7,6 +7,10 @@ on:
         description: 'Project language'
         required: true
         type: string
+    secrets:
+      snyk-token:
+        description: 'Snyk API token'
+        required: false
 
 jobs:
   test:
