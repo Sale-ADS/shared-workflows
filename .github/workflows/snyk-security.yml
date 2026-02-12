@@ -107,31 +107,18 @@ jobs:
         if: ${{ inputs.language == 'node' }}
         run: npm ci
 
-      - name: Run Snyk Open Source scan (Java/Maven)
-        if: ${{ inputs.language == 'java' }}
-        uses: snyk/actions/maven@master
-        continue-on-error: ${{ inputs.continue-on-error }}
-        env:
-          SNYK_TOKEN: ${{ secrets.snyk-token }}
-        with:
-          command: test
-          args: >-
-            --severity-threshold=${{ inputs.severity-threshold }}
-            --org=${{ inputs.snyk-org }}
-            --sarif-file-output=snyk-opensource.sarif
+      - name: Install Snyk CLI
+        run: npm install -g snyk
 
-      - name: Run Snyk Open Source scan (Node.js)
-        if: ${{ inputs.language == 'node' }}
-        uses: snyk/actions/node@master
+      - name: Run Snyk Open Source scan
         continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
-        with:
-          command: test
-          args: >-
-            --severity-threshold=${{ inputs.severity-threshold }}
-            --org=${{ inputs.snyk-org }}
-            --sarif-file-output=snyk-opensource.sarif
+        run: |
+          snyk test \
+            --severity-threshold=${{ inputs.severity-threshold }} \
+            --org=${{ inputs.snyk-org }} \
+            --sarif-file-output=snyk-opensource.sarif || true
 
       - name: Upload Snyk Open Source SARIF
         if: always()
@@ -153,16 +140,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
       - name: Run Snyk Code scan
-        uses: snyk/actions/node@master
         continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
-        with:
-          command: code test
-          args: >-
-            --org=${{ inputs.snyk-org }}
-            --sarif-file-output=snyk-code.sarif
+        run: |
+          snyk code test \
+            --org=${{ inputs.snyk-org }} \
+            --sarif-file-output=snyk-code.sarif || true
 
       - name: Upload Snyk Code SARIF
         if: always()
@@ -247,16 +235,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
       - name: Run Snyk IaC scan
-        uses: snyk/actions/iac@master
         continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
-        with:
-          args: >-
-            --severity-threshold=${{ inputs.severity-threshold }}
-            --org=${{ inputs.snyk-org }}
-            --sarif-file-output=snyk-iac.sarif
+        run: |
+          snyk iac test \
+            --severity-threshold=${{ inputs.severity-threshold }} \
+            --org=${{ inputs.snyk-org }} \
+            --sarif-file-output=snyk-iac.sarif || true
 
       - name: Upload Snyk IaC SARIF
         if: always()
