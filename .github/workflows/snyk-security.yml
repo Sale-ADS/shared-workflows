@@ -96,10 +96,6 @@ jobs:
           distribution: ${{ inputs.java-distribution }}
           cache: maven
 
-      - name: Build Java project for dependency resolution
-        if: ${{ inputs.language == 'java' }}
-        run: ./mvnw install -DskipTests -q
-
       - name: Setup Node.js
         if: ${{ inputs.language == 'node' }}
         uses: actions/setup-node@v4
@@ -111,7 +107,21 @@ jobs:
         if: ${{ inputs.language == 'node' }}
         run: npm ci
 
-      - name: Run Snyk Open Source scan
+      - name: Run Snyk Open Source scan (Java/Maven)
+        if: ${{ inputs.language == 'java' }}
+        uses: snyk/actions/maven@master
+        continue-on-error: ${{ inputs.continue-on-error }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        with:
+          command: test
+          args: >-
+            --severity-threshold=${{ inputs.severity-threshold }}
+            --org=${{ inputs.snyk-org }}
+            --sarif-file-output=snyk-opensource.sarif
+
+      - name: Run Snyk Open Source scan (Node.js)
+        if: ${{ inputs.language == 'node' }}
         uses: snyk/actions/node@master
         continue-on-error: ${{ inputs.continue-on-error }}
         env:
