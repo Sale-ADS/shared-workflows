@@ -62,11 +62,6 @@ on:
         required: false
         type: string
         default: './Dockerfile'
-      continue-on-error:
-        description: 'If true, scan failures do not fail the workflow (report-only mode)'
-        required: false
-        type: boolean
-        default: true
     secrets:
       snyk-token:
         description: 'Snyk API token'
@@ -83,7 +78,6 @@ jobs:
     name: Snyk Open Source
     runs-on: ubuntu-latest
     if: ${{ inputs.scan-open-source }}
-    continue-on-error: ${{ inputs.continue-on-error }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -111,14 +105,13 @@ jobs:
         run: npm install -g snyk
 
       - name: Run Snyk Open Source scan
-        continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
         run: |
           snyk test \
             --severity-threshold=${{ inputs.severity-threshold }} \
             --org=${{ inputs.snyk-org }} \
-            --sarif-file-output=snyk-opensource.sarif || true
+            --sarif-file-output=snyk-opensource.sarif
 
       - name: Upload Snyk Open Source SARIF
         if: always()
@@ -135,7 +128,6 @@ jobs:
     name: Snyk Code (SAST)
     runs-on: ubuntu-latest
     if: ${{ inputs.scan-code }}
-    continue-on-error: ${{ inputs.continue-on-error }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -144,13 +136,12 @@ jobs:
         run: npm install -g snyk
 
       - name: Run Snyk Code scan
-        continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
         run: |
           snyk code test \
             --org=${{ inputs.snyk-org }} \
-            --sarif-file-output=snyk-code.sarif || true
+            --sarif-file-output=snyk-code.sarif
 
       - name: Upload Snyk Code SARIF
         if: always()
@@ -167,7 +158,6 @@ jobs:
     name: Snyk Container
     runs-on: ubuntu-latest
     if: ${{ inputs.scan-container && inputs.docker-image-name != '' }}
-    continue-on-error: ${{ inputs.continue-on-error }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -202,24 +192,26 @@ jobs:
             -f ${{ inputs.dockerfile-path }} \
             .
 
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
       - name: Run Snyk Container scan
-        uses: snyk/actions/docker@master
-        continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
-        with:
-          image: ${{ inputs.docker-image-name }}:snyk-scan
-          args: >-
-            --severity-threshold=${{ inputs.severity-threshold }}
-            --org=${{ inputs.snyk-org }}
-            --file=${{ inputs.dockerfile-path }}
-            --exclude-app-vulns
+        run: |
+          snyk container test \
+            ${{ inputs.docker-image-name }}:snyk-scan \
+            --severity-threshold=${{ inputs.severity-threshold }} \
+            --org=${{ inputs.snyk-org }} \
+            --file=${{ inputs.dockerfile-path }} \
+            --exclude-app-vulns \
+            --sarif-file-output=snyk-container.sarif
 
       - name: Upload Snyk Container SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: snyk.sarif
+          sarif_file: snyk-container.sarif
           category: snyk-container
         continue-on-error: true
 
@@ -230,7 +222,6 @@ jobs:
     name: Snyk IaC
     runs-on: ubuntu-latest
     if: ${{ inputs.scan-iac }}
-    continue-on-error: ${{ inputs.continue-on-error }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -239,14 +230,13 @@ jobs:
         run: npm install -g snyk
 
       - name: Run Snyk IaC scan
-        continue-on-error: ${{ inputs.continue-on-error }}
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
         run: |
           snyk iac test \
             --severity-threshold=${{ inputs.severity-threshold }} \
             --org=${{ inputs.snyk-org }} \
-            --sarif-file-output=snyk-iac.sarif || true
+            --sarif-file-output=snyk-iac.sarif
 
       - name: Upload Snyk IaC SARIF
         if: always()
