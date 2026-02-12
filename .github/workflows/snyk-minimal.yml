@@ -1,0 +1,25 @@
+name: Snyk Minimal Test
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Project language'
+        required: true
+        type: string
+    secrets:
+      snyk-token:
+        description: 'Snyk API token'
+        required: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo
+        run: echo "Language is ${{ inputs.language }}, token exists=${{ secrets.snyk-token != '' }}"
