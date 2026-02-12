@@ -12,6 +12,11 @@ on:
         description: 'Snyk API token'
         required: false
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
