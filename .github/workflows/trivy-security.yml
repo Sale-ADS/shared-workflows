@@ -101,6 +101,7 @@ jobs:
           format: 'sarif'
           output: 'trivy-dependency.sarif'
           exit-code: '1'
+          limit-severities-for-sarif: true
 
       - name: Upload Trivy dependency SARIF
         if: always()
@@ -129,6 +130,7 @@ jobs:
           format: 'sarif'
           output: 'trivy-secret.sarif'
           exit-code: '1'
+          limit-severities-for-sarif: true
 
       - name: Upload Trivy secret SARIF
         if: always()
@@ -189,6 +191,7 @@ jobs:
           format: 'sarif'
           output: 'trivy-container.sarif'
           exit-code: '1'
+          limit-severities-for-sarif: true
 
       - name: Upload Trivy container SARIF
         if: always()
