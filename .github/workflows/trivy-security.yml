@@ -104,7 +104,7 @@ jobs:
 
       - name: Upload Trivy dependency SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-dependency.sarif
           category: trivy-dependency
@@ -132,7 +132,7 @@ jobs:
 
       - name: Upload Trivy secret SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-secret.sarif
           category: trivy-secret
@@ -192,7 +192,7 @@ jobs:
 
       - name: Upload Trivy container SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-container.sarif
           category: trivy-container
