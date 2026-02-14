@@ -1,0 +1,199 @@
+name: Trivy Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Project language: java or node'
+        required: true
+        type: string
+      java-version:
+        description: 'Java version (only for language=java)'
+        required: false
+        type: string
+        default: '21'
+      java-distribution:
+        description: 'Java distribution (only for language=java)'
+        required: false
+        type: string
+        default: 'corretto'
+      node-version:
+        description: 'Node.js version (only for language=node)'
+        required: false
+        type: string
+        default: '20'
+      severity-threshold:
+        description: 'Minimum severity to report (comma-separated): LOW,MEDIUM,HIGH,CRITICAL'
+        required: false
+        type: string
+        default: 'HIGH,CRITICAL'
+      scan-dependencies:
+        description: 'Run dependency vulnerability scan'
+        required: false
+        type: boolean
+        default: true
+      scan-secrets:
+        description: 'Run secret detection scan'
+        required: false
+        type: boolean
+        default: true
+      scan-container:
+        description: 'Run container image scan'
+        required: false
+        type: boolean
+        default: true
+      docker-image-name:
+        description: 'Docker image name for container scanning'
+        required: false
+        type: string
+        default: ''
+      dockerfile-path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: './Dockerfile'
+
+# NOTE: Do NOT add a permissions block here.
+# Callers must declare: permissions: { contents: read, security-events: write, actions: read }
+# Adding permissions here causes startup_failure for private repos calling this reusable workflow.
+
+jobs:
+  # ============================================================
+  # JOB 1: Dependency Vulnerability Scan (replaces Snyk Open Source)
+  # ============================================================
+  trivy-dependency-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-dependencies }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        if: ${{ inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: maven
+
+      - name: Build Java artifact
+        if: ${{ inputs.language == 'java' }}
+        run: ./mvnw install -DskipTests -q
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install Node.js dependencies
+        if: ${{ inputs.language == 'node' }}
+        run: npm ci
+
+      - name: Run Trivy dependency scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scanners: 'vuln'
+          severity: ${{ inputs.severity-threshold }}
+          format: 'sarif'
+          output: 'trivy-dependency.sarif'
+          exit-code: '1'
+
+      - name: Upload Trivy dependency SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-dependency.sarif
+          category: trivy-dependency
+        continue-on-error: true
+
+  # ============================================================
+  # JOB 2: Secret Detection Scan (replaces Snyk Code)
+  # ============================================================
+  trivy-secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-secrets }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scanners: 'secret'
+          format: 'sarif'
+          output: 'trivy-secret.sarif'
+          exit-code: '1'
+
+      - name: Upload Trivy secret SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-secret.sarif
+          category: trivy-secret
+        continue-on-error: true
+
+  # ============================================================
+  # JOB 3: Container Image Scan (replaces Snyk Container)
+  # ============================================================
+  trivy-container-scan:
+    name: Container Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-container && inputs.docker-image-name != '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        if: ${{ inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: maven
+
+      - name: Build Java artifact
+        if: ${{ inputs.language == 'java' }}
+        run: ./mvnw package -DskipTests -q
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install Node.js dependencies
+        if: ${{ inputs.language == 'node' }}
+        run: npm ci
+
+      - name: Build Docker image for scanning
+        run: |
+          docker build \
+            -t ${{ inputs.docker-image-name }}:trivy-scan \
+            -f ${{ inputs.dockerfile-path }} \
+            .
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'image'
+          image-ref: '${{ inputs.docker-image-name }}:trivy-scan'
+          scanners: 'vuln,secret'
+          severity: ${{ inputs.severity-threshold }}
+          format: 'sarif'
+          output: 'trivy-container.sarif'
+          exit-code: '1'
+
+      - name: Upload Trivy container SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-container.sarif
+          category: trivy-container
+        continue-on-error: true
