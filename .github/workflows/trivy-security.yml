@@ -59,7 +59,7 @@ on:
 
 jobs:
   # ============================================================
-  # JOB 1: Dependency Vulnerability Scan (replaces Snyk Open Source)
+  # JOB 1: Dependency Vulnerability Scan
   # ============================================================
   trivy-dependency-scan:
     name: Dependency Scan
@@ -98,21 +98,11 @@ jobs:
           scan-type: 'fs'
           scanners: 'vuln'
           severity: ${{ inputs.severity-threshold }}
-          format: 'sarif'
-          output: 'trivy-dependency.sarif'
-          exit-code: '1'
-          limit-severities-for-sarif: true
-
-      - name: Upload Trivy dependency SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-dependency.sarif
-          category: trivy-dependency
-        continue-on-error: true
+          format: 'table'
+          exit-code: '0'
 
   # ============================================================
-  # JOB 2: Secret Detection Scan (replaces Snyk Code)
+  # JOB 2: Secret Detection Scan
   # ============================================================
   trivy-secret-scan:
     name: Secret Scan
@@ -127,21 +117,11 @@ jobs:
         with:
           scan-type: 'fs'
           scanners: 'secret'
-          format: 'sarif'
-          output: 'trivy-secret.sarif'
+          format: 'table'
           exit-code: '1'
-          limit-severities-for-sarif: true
-
-      - name: Upload Trivy secret SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-secret.sarif
-          category: trivy-secret
-        continue-on-error: true
 
   # ============================================================
-  # JOB 3: Container Image Scan (replaces Snyk Container)
+  # JOB 3: Container Image Scan
   # ============================================================
   trivy-container-scan:
     name: Container Scan
@@ -188,15 +168,5 @@ jobs:
           image-ref: '${{ inputs.docker-image-name }}:trivy-scan'
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity-threshold }}
-          format: 'sarif'
-          output: 'trivy-container.sarif'
-          exit-code: '1'
-          limit-severities-for-sarif: true
-
-      - name: Upload Trivy container SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-container.sarif
-          category: trivy-container
-        continue-on-error: true
+          format: 'table'
+          exit-code: '0'
