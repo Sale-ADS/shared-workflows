@@ -47,6 +47,11 @@ on:
         required: false
         type: boolean
         default: true
+      scan-iac:
+        description: 'Run IaC misconfig scan (Dockerfile, docker-compose, k8s manifests)'
+        required: false
+        type: boolean
+        default: true
       docker-image-name:
         description: 'Docker image name for container scanning'
         required: false
@@ -172,6 +177,28 @@ jobs:
           scan-type: 'image'
           image-ref: '${{ inputs.docker-image-name }}:trivy-scan'
           scanners: 'vuln,secret'
+          severity: ${{ inputs.severity-threshold }}
+          format: 'table'
+          exit-code: ${{ inputs.enforce && '1' || '0' }}
+
+  # ============================================================
+  # JOB 4: IaC / Misconfiguration Scan
+  # Detecta automaticamente Dockerfile, docker-compose, k8s, Helm, Terraform.
+  # Cierra la parte IaC del nodo "Trivy · SCA + IaC".
+  # ============================================================
+  trivy-iac-scan:
+    name: IaC Misconfig Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-iac }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy IaC (misconfig) scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
           severity: ${{ inputs.severity-threshold }}
           format: 'table'
           exit-code: ${{ inputs.enforce && '1' || '0' }}
