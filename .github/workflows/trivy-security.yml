@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: '20'
+      package-manager:
+        description: 'Node package manager: npm | pnpm | yarn | none. "none" saltea el install (Trivy lee el lockfile directo).'
+        required: false
+        type: string
+        default: 'npm'
       severity-threshold:
         description: 'Minimum severity to report (comma-separated): LOW,MEDIUM,HIGH,CRITICAL'
         required: false
@@ -100,7 +105,13 @@ jobs:
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
-        run: npm ci --ignore-scripts
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) corepack enable && pnpm install --frozen-lockfile --ignore-scripts ;;
+            yarn) corepack enable && yarn install --frozen-lockfile --ignore-scripts ;;
+            none) echo "Skip install: Trivy lee el lockfile directamente" ;;
+            *)    npm ci --ignore-scripts ;;
+          esac
 
       - name: Run Trivy dependency scan
         uses: aquasecurity/trivy-action@0.35.0
@@ -162,7 +173,13 @@ jobs:
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
-        run: npm ci --ignore-scripts
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) corepack enable && pnpm install --frozen-lockfile --ignore-scripts ;;
+            yarn) corepack enable && yarn install --frozen-lockfile --ignore-scripts ;;
+            none) echo "Skip install: Trivy lee el lockfile directamente" ;;
+            *)    npm ci --ignore-scripts ;;
+          esac
 
       - name: Build Docker image for scanning
         run: |
