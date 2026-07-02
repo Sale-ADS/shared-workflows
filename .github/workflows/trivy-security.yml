@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: 'HIGH,CRITICAL'
+      enforce:
+        description: 'Block the pipeline on findings (exit-code 1). false = warn-only (rollout gradual, canario primero).'
+        required: false
+        type: boolean
+        default: false
       scan-dependencies:
         description: 'Run dependency vulnerability scan'
         required: false
@@ -90,7 +95,7 @@ jobs:
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run Trivy dependency scan
         uses: aquasecurity/trivy-action@0.35.0
@@ -99,7 +104,7 @@ jobs:
           scanners: 'vuln'
           severity: ${{ inputs.severity-threshold }}
           format: 'table'
-          exit-code: '0'
+          exit-code: ${{ inputs.enforce && '1' || '0' }}
 
   # ============================================================
   # JOB 2: Secret Detection Scan
@@ -152,7 +157,7 @@ jobs:
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build Docker image for scanning
         run: |
@@ -169,4 +174,4 @@ jobs:
           scanners: 'vuln,secret'
           severity: ${{ inputs.severity-threshold }}
           format: 'table'
-          exit-code: '0'
+          exit-code: ${{ inputs.enforce && '1' || '0' }}

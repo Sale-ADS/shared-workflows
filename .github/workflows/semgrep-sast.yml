@@ -1,0 +1,55 @@
+name: Semgrep SAST
+
+# SAST bloqueante org-wide con Semgrep OSS (gratis, sin token del SaaS).
+# Cierra F2-04 (Snyk solo en 1 repo / sin SAST real) y alimenta F2-22 (SARIF al Security tab).
+# Mismo patrón que trivy-security.yml: enforce=false => warn-only (rollout gradual, canario primero).
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: 'Semgrep rulesets (space/comma separated registry packs, gratis).'
+        required: false
+        type: string
+        default: 'p/default p/security-audit p/secrets p/owasp-top-ten'
+      enforce:
+        description: 'Block the pipeline on findings (exit-code 1). false = warn-only.'
+        required: false
+        type: boolean
+        default: false
+      upload-sarif:
+        description: 'Upload results to the GitHub Security tab (requires security-events: write in caller).'
+        required: false
+        type: boolean
+        default: true
+
+# NOTE: Do NOT add a permissions block here.
+# Callers must declare: permissions: { contents: read, security-events: write }
+
+jobs:
+  semgrep:
+    name: SAST Scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        # --error hace fallar el job ante findings solo cuando enforce=true.
+        run: |
+          CONFIG_FLAGS=""
+          for pack in ${{ inputs.config }}; do
+            CONFIG_FLAGS="$CONFIG_FLAGS --config $pack"
+          done
+          semgrep scan $CONFIG_FLAGS \
+            --sarif --output semgrep.sarif \
+            ${{ inputs.enforce && '--error' || '' }}
+
+      - name: Upload SARIF to Security tab
+        if: ${{ inputs.upload-sarif && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
