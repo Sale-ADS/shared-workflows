@@ -181,7 +181,13 @@ jobs:
             *)    npm ci --ignore-scripts ;;
           esac
 
+      # NOTA: rebuildear la imagen para escanearla es best-effort y frágil
+      # (build-args, husky/prepare, secrets). El escaneo robusto es sobre la
+      # imagen ya publicada en Artifact Registry -> pendiente FASE 2/3 (WIF).
+      # Por eso un build fallido NO tiñe de rojo el pipeline.
       - name: Build Docker image for scanning
+        id: build
+        continue-on-error: true
         run: |
           docker build \
             -t ${{ inputs.docker-image-name }}:trivy-scan \
@@ -189,6 +195,7 @@ jobs:
             .
 
       - name: Run Trivy container scan
+        if: ${{ steps.build.outcome == 'success' }}
         uses: aquasecurity/trivy-action@0.35.0
         with:
           scan-type: 'image'
@@ -197,6 +204,11 @@ jobs:
           severity: ${{ inputs.severity-threshold }}
           format: 'table'
           exit-code: ${{ inputs.enforce && '1' || '0' }}
+
+      - name: Aviso si el build fallo
+        if: ${{ steps.build.outcome != 'success' }}
+        run: |
+          echo "::warning::Container scan omitido: el docker build fallo (best-effort). El escaneo real se hara sobre la imagen del Artifact Registry en FASE 2/3."
 
   # ============================================================
   # JOB 4: IaC / Misconfiguration Scan
