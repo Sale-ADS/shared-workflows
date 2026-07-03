@@ -101,7 +101,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          # cache npm solo cuando aplica; pnpm/yarn/none pueden no tener package-lock.json y romperia setup-node
+          cache: ${{ inputs.package-manager == 'npm' && 'npm' || '' }}
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
@@ -169,7 +170,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          # cache npm solo cuando aplica; pnpm/yarn/none pueden no tener package-lock.json y romperia setup-node
+          cache: ${{ inputs.package-manager == 'npm' && 'npm' || '' }}
 
       - name: Install Node.js dependencies
         if: ${{ inputs.language == 'node' }}
