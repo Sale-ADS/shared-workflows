@@ -541,44 +541,55 @@ jobs:
             echo "::error::SCANNER_ERROR: trusted base/head commit is missing from the checkout."
             exit 30
           fi
-          baseline_root="$RUNNER_TEMP/trivy-fs-base"
-          head_root="$RUNNER_TEMP/trivy-fs-head"
-          mkdir -p "$baseline_root" "$head_root"
-          git archive "$baseline" | tar -x -C "$baseline_root"
-          git archive "$HEAD_SHA" | tar -x -C "$head_root"
+          compare_root="$RUNNER_TEMP/trivy-fs-compare"
+          mkdir -p "$compare_root/base" "$compare_root/head"
+          git archive "$baseline" | tar -x -C "$compare_root/base"
+          git archive "$HEAD_SHA" | tar -x -C "$compare_root/head"
           {
             echo "BASELINE_COMMIT=$baseline"
-            echo "BASELINE_ROOT=$baseline_root"
-            echo "HEAD_ROOT=$head_root"
+            echo "HEAD_COMMIT=$HEAD_SHA"
+            echo "COMPARE_ROOT=$compare_root"
           } >> "$GITHUB_ENV"
-      - name: Scan HEAD dependencies and refresh the database
+      - name: Scan trusted base and HEAD in one database snapshot
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
-          scan-ref: ${{ env.HEAD_ROOT }}
+          scan-ref: ${{ env.COMPARE_ROOT }}
           format: json
-          output: trivy-fs-head.json
+          output: trivy-fs-combined.json
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "0"
           cache: "false"
           version: v0.69.3
-      - name: Scan trusted base dependencies with the same database
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_SKIP_DB_UPDATE: "true"
-          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
-        with:
-          scan-type: fs
-          scan-ref: ${{ env.BASELINE_ROOT }}
-          format: json
-          output: trivy-fs-base.json
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "0"
-          cache: "false"
-          skip-setup-trivy: "true"
-          version: v0.69.3
+      - name: Split and validate trusted comparison evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for side in base head; do
+            jq --arg side "$side" '
+              .ArtifactName = $side
+              | .Results = [
+                  .Results[]?
+                  | select((.Target // "") | test("(^|/)" + $side + "/"))
+                  | .Target |= sub("^(.*?/)?" + $side + "/"; "")
+                ]
+            ' trivy-fs-combined.json > "trivy-fs-$side.json"
+          done
+          base_targets="$(jq '[.Results[]?] | length' trivy-fs-base.json)"
+          head_targets="$(jq '[.Results[]?] | length' trivy-fs-head.json)"
+          if (( base_targets == 0 || head_targets == 0 )); then
+            echo "::error title=Trivy SCA SCANNER_ERROR::The single-snapshot scan did not produce evidence for both trusted base and HEAD."
+            exit 30
+          fi
+          if git diff --quiet "$BASELINE_COMMIT" "$HEAD_COMMIT" -- pom.xml; then
+            base_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-base.json)"
+            head_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-head.json)"
+            if [[ "$base_findings" != "$head_findings" ]]; then
+              echo "::error title=Trivy SCA SCANNER_ERROR::Dependency findings differ although pom.xml is unchanged; evidence is not trustworthy."
+              exit 30
+            fi
+          fi
       - name: Convert complete HEAD evidence to SARIF
         shell: bash
         run: |
@@ -649,6 +660,7 @@ jobs:
         with:
           name: trivy-fs-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            trivy-fs-combined.json
             trivy-fs-full.sarif
             trivy-fs-base.json
             trivy-fs-head.json
