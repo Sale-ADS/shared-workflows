@@ -542,14 +542,20 @@ jobs:
             exit 30
           fi
           baseline_root="$RUNNER_TEMP/trivy-fs-base"
-          git worktree add --detach "$baseline_root" "$baseline"
-          echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
-          echo "BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+          head_root="$RUNNER_TEMP/trivy-fs-head"
+          mkdir -p "$baseline_root" "$head_root"
+          git archive "$baseline" | tar -x -C "$baseline_root"
+          git archive "$HEAD_SHA" | tar -x -C "$head_root"
+          {
+            echo "BASELINE_COMMIT=$baseline"
+            echo "BASELINE_ROOT=$baseline_root"
+            echo "HEAD_ROOT=$head_root"
+          } >> "$GITHUB_ENV"
       - name: Scan HEAD dependencies and refresh the database
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
-          scan-ref: .
+          scan-ref: ${{ env.HEAD_ROOT }}
           format: json
           output: trivy-fs-head.json
           severity: CRITICAL,HIGH
