@@ -545,15 +545,14 @@ jobs:
           git worktree add --detach "$baseline_root" "$baseline"
           echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
           echo "BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
-      - name: Report complete HEAD dependency findings
+      - name: Scan HEAD dependencies and refresh the database
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          format: sarif
-          output: trivy-fs-full.sarif
+          format: json
+          output: trivy-fs-head.json
           severity: CRITICAL,HIGH
-          limit-severities-for-sarif: "true"
           ignore-unfixed: true
           exit-code: "0"
           cache: "false"
@@ -574,22 +573,20 @@ jobs:
           cache: "false"
           skip-setup-trivy: "true"
           version: v0.69.3
-      - name: Scan HEAD dependencies with the same database
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        env:
-          TRIVY_SKIP_DB_UPDATE: "true"
-          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: json
-          output: trivy-fs-head.json
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "0"
-          cache: "false"
-          skip-setup-trivy: "true"
-          version: v0.69.3
+      - name: Convert complete HEAD evidence to SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy convert \
+            --format sarif \
+            --output trivy-fs-full.sarif \
+            trivy-fs-head.json
+          json_count="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs-head.json)"
+          sarif_count="$(jq '[.runs[]?.results[]?] | length' trivy-fs-full.sarif)"
+          if [[ "$json_count" != "$sarif_count" ]]; then
+            echo "::error title=Trivy SCA SCANNER_ERROR::JSON/SARIF evidence mismatch: JSON=$json_count SARIF=$sarif_count."
+            exit 30
+          fi
       - name: Calculate and enforce dependency delta
         shell: bash
         run: |
