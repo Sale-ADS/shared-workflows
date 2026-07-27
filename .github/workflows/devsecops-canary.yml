@@ -482,6 +482,7 @@ jobs:
           (( inherited > 0 )) && decision=WARN
           (( introduced > 0 )) && decision=BLOCK
 
+          exec 3>&1
           {
             echo "### Semgrep SAST delta — \`$decision\`"
             echo
@@ -508,7 +509,7 @@ jobs:
               ' semgrep-delta.sarif |
                 while IFS=$'\t' read -r rule file line severity cwe message; do
                   printf '| %s | %s | %s | %s | %s | %s |\n' "$rule" "$file" "$line" "$severity" "$cwe" "${message//|/\\|}"
-                  echo "::error file=$file,line=$line,title=Semgrep $rule BLOCK::Estado=nuevo; severidad=$severity; $message Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT."
+                  echo "::error file=$file,line=$line,title=Semgrep $rule BLOCK::Estado=nuevo; severidad=$severity; $message Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** una entrada HTTP alcanzable fluye hacia ejecución de comandos del sistema (CWE-78)."
@@ -657,6 +658,7 @@ jobs:
           decision=PASS
           (( inherited > 0 )) && decision=WARN
           (( findings > 0 )) && decision=BLOCK
+          exec 3>&1
           {
             echo "### Trivy filesystem delta — \`$decision\`"
             echo
@@ -670,7 +672,7 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-fs-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error file=$target,line=1,title=Trivy SCA $id BLOCK::Estado=nuevo; severidad=$severity; dependencia=$package@$installed; corrección=$fixed. Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}."
+                  echo "::error file=$target,line=1,title=Trivy SCA $id BLOCK::Estado=nuevo; severidad=$severity; dependencia=$package@$installed; corrección=$fixed. Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** vulnerabilidad High/Critical nueva con una corrección publicada; requiere validación de alcance durante el canary."
@@ -810,6 +812,7 @@ jobs:
           decision=PASS
           (( inherited > 0 )) && decision=WARN
           (( findings > 0 )) && decision=BLOCK
+          exec 3>&1
           {
             echo "### Trivy image delta — \`$decision\`"
             echo
@@ -823,7 +826,7 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-image-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error title=Trivy container $id BLOCK::Estado=nuevo; severidad=$severity; imagen=${{ inputs.image-name }}; target=$target; paquete=$package@$installed; corrección=$fixed. Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}."
+                  echo "::error title=Trivy container $id BLOCK::Estado=nuevo; severidad=$severity; imagen=${{ inputs.image-name }}; target=$target; paquete=$package@$installed; corrección=$fixed. Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** la imagen del PR introduce una vulnerabilidad High/Critical corregible que no existe en la imagen de la base confiable."
