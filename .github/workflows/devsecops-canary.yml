@@ -585,6 +585,7 @@ jobs:
         with:
           scan-type: fs
           scan-ref: ${{ env.COMPARE_ROOT }}
+          scanners: vuln
           format: json
           output: trivy-fs-combined.json
           severity: CRITICAL,HIGH
@@ -748,6 +749,7 @@ jobs:
         with:
           scan-type: image
           scan-ref: ${{ inputs.image-name }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scanners: vuln
           format: sarif
           output: trivy-image-full.sarif
           severity: CRITICAL,HIGH
@@ -764,6 +766,7 @@ jobs:
         with:
           scan-type: image
           scan-ref: ${{ inputs.image-name }}:base-${{ env.BASELINE_COMMIT }}
+          scanners: vuln
           format: json
           output: trivy-image-base.json
           severity: CRITICAL,HIGH
@@ -780,6 +783,7 @@ jobs:
         with:
           scan-type: image
           scan-ref: ${{ inputs.image-name }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scanners: vuln
           format: json
           output: trivy-image-head.json
           severity: CRITICAL,HIGH
