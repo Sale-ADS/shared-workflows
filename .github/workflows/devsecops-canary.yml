@@ -348,7 +348,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep@sha256:2b33f46ba66cf8cc2ad59ccfa7d22951fd00c632c38f1339e84ec8e6e641a942
+      image: semgrep/semgrep@sha256:bdf7013b2c3634a487671158da77c554f531742326b543a9464d2adf6c433ac8 # 1.171.0
     permissions:
       contents: read
     steps:
@@ -396,6 +396,34 @@ jobs:
                         - pattern: new ProcessBuilder($SINK)
                     - focus-metavariable: $SINK
           YAML
+      - name: Validate pinned Semgrep engine and policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(semgrep --version)"
+          if [[ "$version" != "1.171.0" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Expected pinned Semgrep 1.171.0, received $version."
+            exit 30
+          fi
+          cat > /tmp/semgrep-policy-self-test.java <<'JAVA'
+          import jakarta.ws.rs.QueryParam;
+          import java.io.IOException;
+          class SemgrepPolicySelfTest {
+            Process unsafe(@QueryParam("command") String command) throws IOException {
+              return Runtime.getRuntime().exec(command);
+            }
+          }
+          JAVA
+          semgrep scan \
+            --config /tmp/semgrep-saleads-policy.yml \
+            --json \
+            --output /tmp/semgrep-policy-self-test.json \
+            /tmp/semgrep-policy-self-test.java
+          findings="$(jq '[.results[]? | select(.check_id | endswith("saleads-java-command-injection"))] | length' /tmp/semgrep-policy-self-test.json)"
+          if [[ "$findings" != "1" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one command-injection finding, received $findings."
+            exit 30
+          fi
       - name: Resolve trusted comparison commit
         shell: bash
         env:
@@ -502,6 +530,7 @@ jobs:
             semgrep-full.sarif
             semgrep-delta.sarif
             /tmp/semgrep-saleads-policy.yml
+            /tmp/semgrep-policy-self-test.json
           if-no-files-found: error
           retention-days: 7
 
