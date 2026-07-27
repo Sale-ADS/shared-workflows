@@ -1,0 +1,6 @@
+# shared-workflows is a security trust root with organization-wide blast radius.
+* @sa-backdev @andrewramirez-ciber
+
+# Workflow changes require the accountable Engineering Manager and security reviewer.
+/.github/workflows/ @sa-backdev @andrewramirez-ciber
+/.github/CODEOWNERS @sa-backdev @andrewramirez-ciber
