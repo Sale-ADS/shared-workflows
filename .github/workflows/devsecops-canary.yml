@@ -1,5 +1,24 @@
 name: SaleADS DevSecOps Canary
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust-root reusable workflow. It checks out, BUILDS and analyzes untrusted PR
+# code (docker build runs Dockerfile RUN steps = arbitrary code on the runner).
+#
+# CALLER CONTRACT — required for this gate to stay safe:
+#   • Trigger the caller on `pull_request` (or `push` on a protected branch).
+#     NEVER call it from `pull_request_target` or `workflow_run`: those grant a
+#     write-scoped token and repository secrets to untrusted PR code. The
+#     `guardrails` job below rejects those contexts, but keep callers correct.
+#   • Do NOT pass `secrets: inherit`. This workflow needs no secrets and declares
+#     no `secrets:` block on purpose; grant the caller only `contents: read`.
+#
+# COVERAGE SCOPE (canary): SAST and SCA are tuned for Java/Maven repositories.
+#   • Semgrep enforces a single Java rule (CWE-78) and the SCA consistency guard
+#     keys on `pom.xml`. On non-Java/Maven consumers these two controls PASS
+#     without evaluating anything — broaden the ruleset and the guard before
+#     onboarding such a service, or the green check is misleading.
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   workflow_call:
     inputs:
@@ -16,10 +35,31 @@ on:
 permissions: {}
 
 jobs:
+  guardrails:
+    name: guardrails / caller-context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Reject privileged trigger contexts
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request_target|workflow_run)
+              echo "::error title=Unsafe caller context::This trust-root workflow builds and analyzes untrusted PR code and must never run under '$EVENT_NAME', which grants a write-scoped token and repository secrets to that code. Call it from 'pull_request' (or 'push' on a protected branch) and do not pass 'secrets: inherit'."
+              exit 1
+              ;;
+          esac
+          echo "Caller context '$EVENT_NAME' accepted." >> "$GITHUB_STEP_SUMMARY"
+
   secrets:
     name: secrets / gitleaks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    needs: guardrails
     permissions:
       contents: read
     steps:
@@ -347,6 +387,7 @@ jobs:
     name: sast / semgrep-delta
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    needs: guardrails
     container:
       image: semgrep/semgrep@sha256:bdf7013b2c3634a487671158da77c554f531742326b543a9464d2adf6c433ac8 # 1.171.0
     permissions:
@@ -539,6 +580,7 @@ jobs:
     name: sca / trivy-filesystem-delta
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    needs: guardrails
     permissions:
       contents: read
     steps:
@@ -637,6 +679,8 @@ jobs:
           fi
       - name: Calculate and enforce dependency delta
         shell: bash
+        env:
+          SUPPORT_CONTACT: ${{ inputs.support-contact }}
         run: |
           set -euo pipefail
           if ! jq --slurpfile base trivy-fs-base.json '
@@ -673,13 +717,13 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-fs-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error file=$target,line=1,title=Trivy SCA $id BLOCK::Estado=nuevo; severidad=$severity; dependencia=$package@$installed; corrección=$fixed. Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}." >&3
+                  echo "::error file=$target,line=1,title=Trivy SCA $id BLOCK::Estado=nuevo; severidad=$severity; dependencia=$package@$installed; corrección=$fixed. Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $advisory. Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** vulnerabilidad High/Critical nueva con una corrección publicada; requiere validación de alcance durante el canary."
               echo "**Corrección:** actualice cada dependencia a la versión corregida indicada y regenere el lockfile."
               echo "**Validación:** reejecute el PR y confirme que el fingerprint ya no aparece en el delta."
-              echo "**Ayuda/excepción:** ${{ inputs.support-contact }}. Una excepción requiere evidencia, owner, control compensatorio y vencimiento en la rama protegida."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere evidencia, owner, control compensatorio y vencimiento en la rama protegida."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if (( findings > 0 )); then
@@ -704,8 +748,12 @@ jobs:
     name: container / trivy-image-delta
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    needs: guardrails
     permissions:
       contents: read
+    env:
+      IMAGE_NAME: ${{ inputs.image-name }}
+      SUPPORT_CONTACT: ${{ inputs.support-contact }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -741,14 +789,14 @@ jobs:
           echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
           echo "BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
       - name: Build HEAD image
-        run: docker build --pull --tag "${{ inputs.image-name }}:head-${{ github.event.pull_request.head.sha || github.sha }}" .
+        run: docker build --pull --tag "$IMAGE_NAME:head-${{ github.event.pull_request.head.sha || github.sha }}" .
       - name: Build trusted base image
-        run: docker build --tag "${{ inputs.image-name }}:base-$BASELINE_COMMIT" "$BASELINE_ROOT"
+        run: docker build --tag "$IMAGE_NAME:base-$BASELINE_COMMIT" "$BASELINE_ROOT"
       - name: Report complete HEAD image findings
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
-          scan-ref: ${{ inputs.image-name }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scan-ref: ${{ env.IMAGE_NAME }}:head-${{ github.event.pull_request.head.sha || github.sha }}
           scanners: vuln
           format: sarif
           output: trivy-image-full.sarif
@@ -765,7 +813,7 @@ jobs:
           TRIVY_SKIP_JAVA_DB_UPDATE: "true"
         with:
           scan-type: image
-          scan-ref: ${{ inputs.image-name }}:base-${{ env.BASELINE_COMMIT }}
+          scan-ref: ${{ env.IMAGE_NAME }}:base-${{ env.BASELINE_COMMIT }}
           scanners: vuln
           format: json
           output: trivy-image-base.json
@@ -782,7 +830,7 @@ jobs:
           TRIVY_SKIP_JAVA_DB_UPDATE: "true"
         with:
           scan-type: image
-          scan-ref: ${{ inputs.image-name }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scan-ref: ${{ env.IMAGE_NAME }}:head-${{ github.event.pull_request.head.sha || github.sha }}
           scanners: vuln
           format: json
           output: trivy-image-head.json
@@ -830,13 +878,13 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-image-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error title=Trivy container $id BLOCK::Estado=nuevo; severidad=$severity; imagen=${{ inputs.image-name }}; target=$target; paquete=$package@$installed; corrección=$fixed. Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $advisory. Ayuda/excepción: ${{ inputs.support-contact }}." >&3
+                  echo "::error title=Trivy container $id BLOCK::Estado=nuevo; severidad=$severity; imagen=$IMAGE_NAME; target=$target; paquete=$package@$installed; corrección=$fixed. Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $advisory. Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** la imagen del PR introduce una vulnerabilidad High/Critical corregible que no existe en la imagen de la base confiable."
               echo "**Corrección:** actualice la imagen base o el paquete a la versión corregida y reconstruya."
               echo "**Validación:** reejecute el PR y confirme que el fingerprint desaparece del delta de imagen."
-              echo "**Ayuda/excepción:** ${{ inputs.support-contact }}. Una excepción requiere evidencia, owner, control compensatorio y vencimiento."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere evidencia, owner, control compensatorio y vencimiento."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if (( findings > 0 )); then
