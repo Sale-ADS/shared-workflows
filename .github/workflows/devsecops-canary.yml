@@ -436,6 +436,30 @@ jobs:
                         - pattern: getRuntime().exec($SINK)
                         - pattern: new ProcessBuilder($SINK)
                     - focus-metavariable: $SINK
+            - id: saleads-node-command-injection
+              message: Untrusted HTTP input reaches a Node child_process command sink.
+              languages: [js, ts]
+              severity: ERROR
+              mode: taint
+              metadata:
+                category: security
+                cwe: CWE-78
+                source: Express/Nest request property
+                sink: child_process.exec / execSync
+                remediation: Never pass request input to the operating system; map an allowlisted operation identifier to a fixed executable and argument values.
+              pattern-sources:
+                - pattern-either:
+                    - pattern: $REQ.query
+                    - pattern: $REQ.body
+                    - pattern: $REQ.params
+              pattern-sinks:
+                - patterns:
+                    - pattern-either:
+                        - pattern: child_process.exec($SINK, ...)
+                        - pattern: child_process.execSync($SINK, ...)
+                        - pattern: exec($SINK, ...)
+                        - pattern: execSync($SINK, ...)
+                    - focus-metavariable: $SINK
           YAML
       - name: Validate pinned Semgrep engine and policy
         shell: bash
@@ -462,7 +486,23 @@ jobs:
             /tmp/semgrep-policy-self-test.java
           findings="$(jq '[.results[]? | select(.check_id | endswith("saleads-java-command-injection"))] | length' /tmp/semgrep-policy-self-test.json)"
           if [[ "$findings" != "1" ]]; then
-            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one command-injection finding, received $findings."
+            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one Java command-injection finding, received $findings."
+            exit 30
+          fi
+          cat > /tmp/semgrep-policy-self-test.ts <<'TS'
+          import { exec } from 'child_process';
+          export function unsafe(req: any): void {
+            exec(req.query.cmd);
+          }
+          TS
+          semgrep scan \
+            --config /tmp/semgrep-saleads-policy.yml \
+            --json \
+            --output /tmp/semgrep-policy-self-test-node.json \
+            /tmp/semgrep-policy-self-test.ts
+          node_findings="$(jq '[.results[]? | select(.check_id | endswith("saleads-node-command-injection"))] | length' /tmp/semgrep-policy-self-test-node.json)"
+          if [[ "$node_findings" != "1" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one Node command-injection finding, received $node_findings."
             exit 30
           fi
       - name: Resolve trusted comparison commit
@@ -584,6 +624,7 @@ jobs:
             semgrep-delta.sarif
             /tmp/semgrep-saleads-policy.yml
             /tmp/semgrep-policy-self-test.json
+            /tmp/semgrep-policy-self-test-node.json
           if-no-files-found: error
           retention-days: 7
 
