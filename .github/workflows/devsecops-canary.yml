@@ -509,6 +509,17 @@ jobs:
           SUPPORT_CONTACT: ${{ inputs.support-contact }}
         run: |
           set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
           for evidence in semgrep-full.sarif semgrep-delta.sarif; do
             if [[ ! -s "$evidence" ]] || ! jq -e '.runs | type == "array"' "$evidence" >/dev/null; then
               echo "::error title=Semgrep SCANNER_ERROR::Required SARIF evidence $evidence is missing or invalid. Retry once; if it repeats contact $SUPPORT_CONTACT."
@@ -550,7 +561,7 @@ jobs:
               ' semgrep-delta.sarif |
                 while IFS=$'\t' read -r rule file line severity cwe message; do
                   printf '| %s | %s | %s | %s | %s | %s |\n' "$rule" "$file" "$line" "$severity" "$cwe" "${message//|/\\|}"
-                  echo "::error file=$file,line=$line,title=Semgrep $rule BLOCK::Estado=nuevo; severidad=$severity; $message Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                  echo "::error file=$(command_escape "$file"),line=$line,title=Semgrep $(command_escape "$rule") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); $(message_escape "$message") Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** una entrada HTTP alcanzable fluye hacia ejecución de comandos del sistema (CWE-78)."
@@ -683,6 +694,17 @@ jobs:
           SUPPORT_CONTACT: ${{ inputs.support-contact }}
         run: |
           set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
           if ! jq --slurpfile base trivy-fs-base.json '
             ([ $base[0].Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion] | @json ]) as $known
             | .Results |= map(
@@ -717,7 +739,7 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-fs-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error file=$target,line=1,title=Trivy SCA $id BLOCK::Estado=nuevo; severidad=$severity; dependencia=$package@$installed; corrección=$fixed. Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $advisory. Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                  echo "::error file=$(command_escape "$target"),line=1,title=Trivy SCA $(command_escape "$id") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); dependencia=$(message_escape "$package")@$(message_escape "$installed"); corrección=$(message_escape "$fixed"). Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $(message_escape "$advisory"). Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** vulnerabilidad High/Critical nueva con una corrección publicada; requiere validación de alcance durante el canary."
@@ -844,6 +866,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
           if ! jq --slurpfile base trivy-image-base.json '
             ([ $base[0].Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion] | @json ]) as $known
             | .Results |= map(
@@ -878,7 +911,7 @@ jobs:
               jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-image-delta.json |
                 while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
                   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
-                  echo "::error title=Trivy container $id BLOCK::Estado=nuevo; severidad=$severity; imagen=$IMAGE_NAME; target=$target; paquete=$package@$installed; corrección=$fixed. Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $advisory. Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                  echo "::error title=Trivy container $(command_escape "$id") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); imagen=$(message_escape "$IMAGE_NAME"); target=$(message_escape "$target"); paquete=$(message_escape "$package")@$(message_escape "$installed"); corrección=$(message_escape "$fixed"). Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $(message_escape "$advisory"). Ayuda/excepción: $SUPPORT_CONTACT." >&3
                 done
               echo
               echo "**Motivo del bloqueo:** la imagen del PR introduce una vulnerabilidad High/Critical corregible que no existe en la imagen de la base confiable."
