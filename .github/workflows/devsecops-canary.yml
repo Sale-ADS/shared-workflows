@@ -1,0 +1,1027 @@
+name: SaleADS DevSecOps Canary
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust-root reusable workflow. It checks out, BUILDS and analyzes untrusted PR
+# code (docker build runs Dockerfile RUN steps = arbitrary code on the runner).
+#
+# CALLER CONTRACT — required for this gate to stay safe:
+#   • Trigger the caller on `pull_request` (or `push` on a protected branch).
+#     NEVER call it from `pull_request_target` or `workflow_run`: those grant a
+#     write-scoped token and repository secrets to untrusted PR code. The
+#     `guardrails` job below rejects those contexts, but keep callers correct.
+#   • Do NOT pass `secrets: inherit`. This workflow needs no secrets and declares
+#     no `secrets:` block on purpose; grant the caller only `contents: read`.
+#
+# COVERAGE SCOPE (canary): SAST and SCA are tuned for Java/Maven repositories.
+#   • Semgrep enforces a single Java rule (CWE-78) and the SCA consistency guard
+#     keys on `pom.xml`. On non-Java/Maven consumers these two controls PASS
+#     without evaluating anything — broaden the ruleset and the guard before
+#     onboarding such a service, or the green check is misleading.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Local image name used for the container scan
+        required: true
+        type: string
+      support-contact:
+        description: Owner or support channel shown in blocking messages
+        required: false
+        default: '@andrewramirez-ciber'
+        type: string
+
+permissions: {}
+
+jobs:
+  guardrails:
+    name: guardrails / caller-context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Reject privileged trigger contexts
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request_target|workflow_run)
+              echo "::error title=Unsafe caller context::This trust-root workflow builds and analyzes untrusted PR code and must never run under '$EVENT_NAME', which grants a write-scoped token and repository secrets to that code. Call it from 'pull_request' (or 'push' on a protected branch) and do not pass 'secrets: inherit'."
+              exit 1
+              ;;
+          esac
+          echo "Caller context '$EVENT_NAME' accepted." >> "$GITHUB_STEP_SUMMARY"
+
+  secrets:
+    name: secrets / gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: guardrails
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve trusted commit range
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          baseline="$HEAD_SHA"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            baseline="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            baseline="$PUSH_BEFORE_SHA"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            baseline="$(git rev-parse HEAD^)"
+          fi
+          if [[ ! "$baseline" =~ ^[0-9a-f]{40}$ || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SCANNER_ERROR: trusted base/head SHA is unavailable. Retry from a complete pull_request or push event."
+            exit 30
+          fi
+          if ! git cat-file -e "$baseline^{commit}" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "::error::SCANNER_ERROR: trusted base/head commit is missing from the checkout."
+            exit 30
+          fi
+          echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
+          echo "HEAD_COMMIT=$HEAD_SHA" >> "$GITHUB_ENV"
+      - name: Install pinned Gitleaks CLI
+        shell: bash
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_ARCHIVE_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GITLEAKS_ARCHIVE_SHA256" "$archive" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" gitleaks
+          chmod 0755 "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
+      - name: Materialize trusted time-bound Gitleaks exceptions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_path=".devsecops/gitleaks-exceptions.tsv"
+          trusted_source="$RUNNER_TEMP/gitleaks-exceptions.tsv"
+          trusted_ignore="$RUNNER_TEMP/trusted.gitleaksignore"
+          active_exceptions="$RUNNER_TEMP/gitleaks-active-exceptions.tsv"
+          policy_errors="$RUNNER_TEMP/gitleaks-policy-errors.txt"
+          : > "$trusted_source"
+          : > "$trusted_ignore"
+          : > "$active_exceptions"
+          : > "$policy_errors"
+
+          if git cat-file -e "${BASELINE_COMMIT}:${source_path}" 2>/dev/null; then
+            git show "${BASELINE_COMMIT}:${source_path}" > "$trusted_source"
+          fi
+
+          today="$(date -u +%F)"
+          line_number=0
+          while IFS=$'\t' read -r fingerprint expires owner reason extra || [[ -n "${fingerprint:-}" ]]; do
+            line_number=$((line_number + 1))
+            [[ -z "${fingerprint// }" || "$fingerprint" == \#* ]] && continue
+            if [[ -n "${extra:-}" || -z "$fingerprint" || ! "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || -z "$owner" || -z "$reason" ]]; then
+              echo "Line ${line_number}: expected fingerprint<TAB>expires<TAB>owner<TAB>reason." >> "$policy_errors"
+              continue
+            fi
+            if ! date -u -d "$expires" +%F >/dev/null 2>&1; then
+              echo "Line ${line_number}: expiry ${expires} is not a real UTC date." >> "$policy_errors"
+              continue
+            fi
+            if [[ "$expires" < "$today" ]]; then
+              echo "Line ${line_number}: exception owned by ${owner} expired on ${expires}." >> "$policy_errors"
+              continue
+            fi
+            printf '%s\n' "$fingerprint" >> "$trusted_ignore"
+            printf '%s\t%s\t%s\t%s\n' "$fingerprint" "$expires" "$owner" "$reason" >> "$active_exceptions"
+          done < "$trusted_source"
+
+          echo "GITLEAKS_TRUSTED_EXCEPTION_COUNT=$(wc -l < "$trusted_ignore" | tr -d ' ')" >> "$GITHUB_ENV"
+      - name: Scan trusted PR history
+        id: gitleaks-scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_ignore="$RUNNER_TEMP/trusted.gitleaksignore"
+          consumer_ignore_present=false
+          if [[ -e .gitleaksignore || -L .gitleaksignore ]]; then
+            consumer_ignore_present=true
+            rm -rf -- .gitleaksignore
+          fi
+          echo "CONSUMER_GITLEAKSIGNORE_PRESENT=$consumer_ignore_present" >> "$GITHUB_ENV"
+          set +e
+          "$RUNNER_TEMP/gitleaks" git \
+            --redact=100 \
+            --no-color \
+            --ignore-gitleaks-allow \
+            --gitleaks-ignore-path "$trusted_ignore" \
+            --max-decode-depth 1 \
+            --max-archive-depth 1 \
+            --max-target-megabytes 0 \
+            --report-format json \
+            --report-path gitleaks-results.json \
+            --exit-code 10 \
+            --log-opts="--no-merges $BASELINE_COMMIT..$HEAD_COMMIT" \
+            --verbose \
+            .
+          status=$?
+          set -e
+          echo "GITLEAKS_EXIT_CODE=$status" >> "$GITHUB_ENV"
+          if [[ ! -f gitleaks-results.json ]]; then
+            printf '%s\n' "Gitleaks exited with code $status without producing JSON evidence." > gitleaks-scanner-error.txt
+          fi
+      - name: Audit trusted-base exception use
+        id: gitleaks-exception-audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          "$RUNNER_TEMP/gitleaks" git \
+            --redact=100 \
+            --no-color \
+            --ignore-gitleaks-allow \
+            --max-decode-depth 1 \
+            --max-archive-depth 1 \
+            --max-target-megabytes 0 \
+            --report-format json \
+            --report-path gitleaks-audit-results.json \
+            --exit-code 10 \
+            --log-opts="--no-merges $BASELINE_COMMIT..$HEAD_COMMIT" \
+            .
+          status=$?
+          set -e
+          echo "GITLEAKS_AUDIT_EXIT_CODE=$status" >> "$GITHUB_ENV"
+          if [[ ! -f gitleaks-audit-results.json ]]; then
+            printf '%s\n' "Gitleaks exception audit exited with code $status without producing JSON evidence." >> gitleaks-scanner-error.txt
+          fi
+      - name: Classify Gitleaks result
+        shell: bash
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"
+            value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+
+          markdown_escape() {
+            local value="$1"
+            value="${value//$'\r'/ }"
+            value="${value//$'\n'/ }"
+            value="${value//'|'/'\|'}"
+            printf '%s' "$value"
+          }
+
+          if [[ -s "$RUNNER_TEMP/gitleaks-policy-errors.txt" ]]; then
+            {
+              echo "### Gitleaks — \`POLICY_ERROR\`"
+              echo
+              echo "The trusted-base exception registry is invalid or contains expired approvals:"
+              echo
+              while IFS= read -r error; do
+                echo "- $(markdown_escape "$error")"
+              done < "$RUNNER_TEMP/gitleaks-policy-errors.txt"
+              echo
+              echo "**How to fix:** renew or remove the exception in the protected base branch. This PR cannot approve its own suppression."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Gitleaks POLICY_ERROR::Trusted exception evidence is invalid or expired. Update it through the protected approval flow."
+            exit 31
+          fi
+
+          if [[ ! -f gitleaks-results.json ]] ||
+             ! jq --exit-status 'type == "array"' gitleaks-results.json >/dev/null ||
+             [[ ! -f gitleaks-audit-results.json ]] ||
+             ! jq --exit-status 'type == "array"' gitleaks-audit-results.json >/dev/null; then
+            {
+              echo "### Gitleaks — \`SCANNER_ERROR\`"
+              echo
+              echo "Gitleaks did not produce valid finding and exception-audit JSON evidence. Retry the workflow; if it repeats, escalate to the workflow owner."
+              echo
+              echo "- Version: \`$GITLEAKS_VERSION\`"
+              echo "- Comparison: \`$BASELINE_COMMIT..$HEAD_COMMIT\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Gitleaks scanner error::SCANNER_ERROR: valid JSON evidence was not produced."
+            exit 30
+          fi
+
+          findings="$(jq 'length' gitleaks-results.json)"
+          audit_findings="$(jq 'length' gitleaks-audit-results.json)"
+          if { [[ "$GITLEAKS_AUDIT_EXIT_CODE" == "0" ]] && [[ "$audit_findings" != "0" ]]; } ||
+             { [[ "$GITLEAKS_AUDIT_EXIT_CODE" == "10" ]] && [[ "$audit_findings" == "0" ]]; } ||
+             [[ "$GITLEAKS_AUDIT_EXIT_CODE" != "0" && "$GITLEAKS_AUDIT_EXIT_CODE" != "10" ]]; then
+            {
+              echo "### Gitleaks — \`SCANNER_ERROR\`"
+              echo
+              echo "The trusted-base exception audit returned inconsistent exit code or JSON evidence."
+              echo
+              echo "**Action:** retry once; if it repeats, escalate to the workflow owner."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Gitleaks scanner error::SCANNER_ERROR: trusted-base exception audit was inconsistent."
+            exit 30
+          fi
+
+          used_exceptions="$RUNNER_TEMP/gitleaks-used-exceptions.tsv"
+          : > "$used_exceptions"
+          while IFS= read -r finding; do
+            finding_fingerprint="$(jq -r '.Fingerprint // empty' <<< "$finding")"
+            [[ -z "$finding_fingerprint" ]] && continue
+            while IFS=$'\t' read -r fingerprint expires owner reason; do
+              if [[ "$finding_fingerprint" == "$fingerprint" ]]; then
+                printf '%s\t%s\t%s\t%s\n' "$fingerprint" "$expires" "$owner" "$reason" >> "$used_exceptions"
+                break
+              fi
+            done < "$RUNNER_TEMP/gitleaks-active-exceptions.tsv"
+          done < <(jq -c '.[]' gitleaks-audit-results.json)
+          sort -u -o "$used_exceptions" "$used_exceptions"
+          used_exception_count="$(wc -l < "$used_exceptions" | tr -d ' ')"
+
+          if [[ "$GITLEAKS_EXIT_CODE" == "0" && "$findings" == "0" ]]; then
+            if [[ "$used_exception_count" != "0" ]]; then
+              {
+                echo "### Gitleaks — \`WARN\`"
+                echo
+                echo "No actionable secret remains after applying trusted-base exceptions, but approved findings were observed and remain auditable."
+                echo
+                echo "| Fingerprint | Owner | Expires | Reason |"
+                echo "|---|---|---|---|"
+                while IFS=$'\t' read -r fingerprint expires owner reason; do
+                  # shellcheck disable=SC2016
+                  printf '| `%s` | %s | `%s` | %s |\n' \
+                    "$(markdown_escape "$fingerprint")" \
+                    "$(markdown_escape "$owner")" \
+                    "$(markdown_escape "$expires")" \
+                    "$(markdown_escape "$reason")"
+                done < "$used_exceptions"
+                echo
+                echo "- Used trusted-base exceptions: **$used_exception_count**"
+                echo "- Suppressions supplied by the PR: **not trusted**"
+                echo "- Values: **100% redacted**"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning title=Gitleaks trusted-base exception::WARN: $used_exception_count approved finding(s) matched active trusted-base exceptions. Review owner and expiry in the job summary."
+              exit 0
+            fi
+            {
+              echo "### Gitleaks — \`PASS\`"
+              echo
+              echo "- Version: \`$GITLEAKS_VERSION\`"
+              echo "- Commits scanned: \`$BASELINE_COMMIT..$HEAD_COMMIT\`"
+              echo "- Actionable secrets introduced: **0**"
+              echo "- Suppressions supplied by the PR: **not trusted**"
+              echo "- Active trusted-base exceptions: **$GITLEAKS_TRUSTED_EXCEPTION_COUNT**"
+              echo "- Consumer \`.gitleaksignore\` observed: **$CONSUMER_GITLEAKSIGNORE_PRESENT**"
+              echo "- Encoded/archive/large-file coverage: **enabled / depth 1 / no size skip**"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$GITLEAKS_EXIT_CODE" != "10" || "$findings" == "0" ]]; then
+            {
+              echo "### Gitleaks — \`SCANNER_ERROR\`"
+              echo
+              echo "Gitleaks returned exit code \`$GITLEAKS_EXIT_CODE\` with \`$findings\` parsed findings. This is a scanner failure, not a security finding."
+              echo
+              echo "**Action:** retry once; if it repeats, escalate to the workflow owner."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Gitleaks scanner error::SCANNER_ERROR: inconsistent exit code and evidence."
+            exit 30
+          fi
+
+          {
+            echo "### Gitleaks — \`BLOCK\`"
+            echo
+            echo "A secret-like value was introduced in this PR. Values are fully redacted."
+            echo
+            echo "| Rule | File | Line | Commit | Fingerprint |"
+            echo "|---|---|---:|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r finding; do
+            rule="$(jq -r '.RuleID // "unknown-rule"' <<< "$finding")"
+            file="$(jq -r '.File // "unknown-file"' <<< "$finding")"
+            line="$(jq -r '.StartLine // 1' <<< "$finding")"
+            commit="$(jq -r '.Commit // "unknown-commit"' <<< "$finding")"
+            fingerprint="$(jq -r '.Fingerprint // "unavailable"' <<< "$finding")"
+            # shellcheck disable=SC2016
+            printf '| %s | %s | %s | `%s` | `%s` |\n' \
+              "$(markdown_escape "$rule")" \
+              "$(markdown_escape "$file")" \
+              "$line" \
+              "$(markdown_escape "$commit")" \
+              "$(markdown_escape "$fingerprint")" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error file=$(command_escape "$file"),line=$line,title=Gitleaks $(command_escape "$rule")::BLOCK: secret-like value detected. Remove it from every PR commit, revoke or rotate it if ever active, and load it from GitHub Secrets or the approved secret manager."
+          done < <(jq -c '.[]' gitleaks-results.json)
+
+          {
+            echo
+            echo "**Impact:** a committed credential can be recovered from Git history even when deleted later."
+            echo
+            echo "**Remediation:** remove the value from every commit in this PR, revoke or rotate it if it was ever active, and inject the replacement through GitHub Secrets or the approved secret manager. Push the rewritten branch and rerun the checks."
+            echo
+            echo "A same-PR \`.gitleaksignore\` entry or \`gitleaks:allow\` comment cannot approve this finding."
+            echo "Consumer \`.gitleaksignore\` observed: **$CONSUMER_GITLEAKSIGNORE_PRESENT**."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 10
+  semgrep:
+    name: sast / semgrep-delta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: guardrails
+    container:
+      image: semgrep/semgrep@sha256:bdf7013b2c3634a487671158da77c554f531742326b543a9464d2adf6c433ac8 # 1.171.0
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Materialize trusted SaleADS policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/semgrep-saleads-policy.yml <<'YAML'
+          rules:
+            - id: saleads-java-command-injection
+              message: Untrusted JAX-RS input reaches an operating-system command sink.
+              languages: [java]
+              severity: ERROR
+              mode: taint
+              metadata:
+                category: security
+                cwe: CWE-78
+                source: JAX-RS request parameter
+                sink: Runtime.exec or ProcessBuilder
+                remediation: Map an allowlisted command identifier to fixed executable and argument values; never pass request input to the operating system.
+              pattern-sources:
+                - patterns:
+                    - pattern-inside: |
+                        $RET $METHOD(..., @QueryParam(...) $TYPE $SOURCE, ...) {
+                          ...
+                        }
+                    - focus-metavariable: $SOURCE
+                - patterns:
+                    - pattern-inside: |
+                        $RET $METHOD(..., @PathParam(...) $TYPE $SOURCE, ...) {
+                          ...
+                        }
+                    - focus-metavariable: $SOURCE
+              pattern-sinks:
+                - patterns:
+                    - pattern-either:
+                        - pattern: Runtime.getRuntime().exec($SINK)
+                        - pattern: getRuntime().exec($SINK)
+                        - pattern: new ProcessBuilder($SINK)
+                    - focus-metavariable: $SINK
+            - id: saleads-node-command-injection
+              message: Untrusted HTTP input reaches a Node child_process command sink.
+              languages: [js, ts]
+              severity: ERROR
+              mode: taint
+              metadata:
+                category: security
+                cwe: CWE-78
+                source: Express/Nest request property
+                sink: child_process.exec / execSync
+                remediation: Never pass request input to the operating system; map an allowlisted operation identifier to a fixed executable and argument values.
+              pattern-sources:
+                - pattern-either:
+                    - pattern: $REQ.query
+                    - pattern: $REQ.body
+                    - pattern: $REQ.params
+              pattern-sinks:
+                - patterns:
+                    - pattern-either:
+                        - pattern: child_process.exec($SINK, ...)
+                        - pattern: child_process.execSync($SINK, ...)
+                        - pattern: exec($SINK, ...)
+                        - pattern: execSync($SINK, ...)
+                    - focus-metavariable: $SINK
+          YAML
+      - name: Validate pinned Semgrep engine and policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(semgrep --version)"
+          if [[ "$version" != "1.171.0" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Expected pinned Semgrep 1.171.0, received $version."
+            exit 30
+          fi
+          cat > /tmp/semgrep-policy-self-test.java <<'JAVA'
+          import jakarta.ws.rs.QueryParam;
+          import java.io.IOException;
+          class SemgrepPolicySelfTest {
+            Process unsafe(@QueryParam("command") String command) throws IOException {
+              return Runtime.getRuntime().exec(command);
+            }
+          }
+          JAVA
+          semgrep scan \
+            --config /tmp/semgrep-saleads-policy.yml \
+            --json \
+            --output /tmp/semgrep-policy-self-test.json \
+            /tmp/semgrep-policy-self-test.java
+          findings="$(jq '[.results[]? | select(.check_id | endswith("saleads-java-command-injection"))] | length' /tmp/semgrep-policy-self-test.json)"
+          if [[ "$findings" != "1" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one Java command-injection finding, received $findings."
+            exit 30
+          fi
+          cat > /tmp/semgrep-policy-self-test.ts <<'TS'
+          import { exec } from 'child_process';
+          export function unsafe(req: any): void {
+            exec(req.query.cmd);
+          }
+          TS
+          semgrep scan \
+            --config /tmp/semgrep-saleads-policy.yml \
+            --json \
+            --output /tmp/semgrep-policy-self-test-node.json \
+            /tmp/semgrep-policy-self-test.ts
+          node_findings="$(jq '[.results[]? | select(.check_id | endswith("saleads-node-command-injection"))] | length' /tmp/semgrep-policy-self-test-node.json)"
+          if [[ "$node_findings" != "1" ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one Node command-injection finding, received $node_findings."
+            exit 30
+          fi
+      - name: Resolve trusted comparison commit
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          baseline="$HEAD_SHA"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            baseline="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            baseline="$PUSH_BEFORE_SHA"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            baseline="$(git rev-parse HEAD^)"
+          fi
+          if [[ ! "$baseline" =~ ^[0-9a-f]{40}$ || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Semgrep SCANNER_ERROR::Trusted base/head SHA is unavailable. Retry the complete pull request event."
+            exit 30
+          fi
+          git cat-file -e "$baseline^{commit}" || {
+            echo "::error title=Semgrep SCANNER_ERROR::Trusted base commit is missing from the checkout."
+            exit 30
+          }
+          echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
+      - name: Report complete Semgrep findings
+        run: semgrep scan --config /tmp/semgrep-saleads-policy.yml --sarif --output semgrep-full.sarif .
+      - name: Scan Semgrep delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(scan --config /tmp/semgrep-saleads-policy.yml --sarif --output semgrep-delta.sarif)
+          if [[ -n "$BASELINE_COMMIT" ]]; then
+            args+=(--baseline-commit "$BASELINE_COMMIT")
+          fi
+          semgrep "${args[@]}" .
+      - name: Classify and enforce Semgrep delta
+        shell: bash
+        env:
+          SUPPORT_CONTACT: ${{ inputs.support-contact }}
+        run: |
+          set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
+          for evidence in semgrep-full.sarif semgrep-delta.sarif; do
+            if [[ ! -s "$evidence" ]] || ! jq -e '.runs | type == "array"' "$evidence" >/dev/null; then
+              echo "::error title=Semgrep SCANNER_ERROR::Required SARIF evidence $evidence is missing or invalid. Retry once; if it repeats contact $SUPPORT_CONTACT."
+              exit 30
+            fi
+          done
+
+          total="$(jq '[.runs[]?.results[]?] | length' semgrep-full.sarif)"
+          introduced="$(jq '[.runs[]?.results[]?] | length' semgrep-delta.sarif)"
+          inherited=$((total - introduced))
+          decision=PASS
+          (( inherited > 0 )) && decision=WARN
+          (( introduced > 0 )) && decision=BLOCK
+
+          exec 3>&1
+          {
+            echo "### Semgrep SAST delta — \`$decision\`"
+            echo
+            echo "- Estado: **$decision**"
+            echo "- Nuevos hallazgos explotables: **$introduced**"
+            echo "- Hallazgos heredados visibles y no bloqueantes: **$inherited**"
+            echo "- Comparación: \`$BASELINE_COMMIT..${{ github.event.pull_request.head.sha || github.sha }}\`"
+            if (( introduced > 0 )); then
+              echo
+              echo "| Regla | Archivo | Línea | Severidad | CWE | Motivo |"
+              echo "|---|---|---:|---|---|---|"
+              jq -r '
+                .runs[] as $run
+                | $run.results[]? as $result
+                | [
+                    ($result.ruleId // "unknown"),
+                    ($result.locations[0].physicalLocation.artifactLocation.uri // "unknown"),
+                    ($result.locations[0].physicalLocation.region.startLine // 1),
+                    ($result.level // "error"),
+                    ([$run.tool.driver.rules[]? | select(.id == $result.ruleId) | .properties.cwe][0] // "review"),
+                    ($result.message.text // "Security rule matched")
+                  ]
+                | @tsv
+              ' semgrep-delta.sarif |
+                while IFS=$'\t' read -r rule file line severity cwe message; do
+                  printf '| %s | %s | %s | %s | %s | %s |\n' "$rule" "$file" "$line" "$severity" "$cwe" "${message//|/\\|}"
+                  echo "::error file=$(command_escape "$file"),line=$line,title=Semgrep $(command_escape "$rule") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); $(message_escape "$message") Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                done
+              echo
+              echo "**Motivo del bloqueo:** una entrada HTTP alcanzable fluye hacia ejecución de comandos del sistema (CWE-78)."
+              echo "**Corrección:** traduzca un identificador permitido a ejecutable y argumentos constantes; nunca pase entrada de la solicitud al sistema operativo."
+              echo "**Validación:** elimine el flujo, agregue una prueba negativa y reejecute este PR."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere fingerprint, evidencia, owner, control compensatorio y vencimiento en la rama protegida."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( introduced > 0 )); then
+            exit 10
+          fi
+      - name: Preserve Semgrep evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-evidence-${{ github.run_id }}
+          path: |
+            semgrep-full.sarif
+            semgrep-delta.sarif
+            /tmp/semgrep-saleads-policy.yml
+            /tmp/semgrep-policy-self-test.json
+            /tmp/semgrep-policy-self-test-node.json
+          if-no-files-found: error
+          retention-days: 7
+
+  dependencies:
+    name: sca / trivy-filesystem-delta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: guardrails
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve trusted comparison commit
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          baseline="$HEAD_SHA"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            baseline="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            baseline="$PUSH_BEFORE_SHA"
+          fi
+          if [[ ! "$baseline" =~ ^[0-9a-f]{40}$ || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SCANNER_ERROR: trusted base/head SHA is unavailable. Retry from a complete pull_request or push event."
+            exit 30
+          fi
+          if ! git cat-file -e "$baseline^{commit}" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "::error::SCANNER_ERROR: trusted base/head commit is missing from the checkout."
+            exit 30
+          fi
+          compare_root="$RUNNER_TEMP/trivy-fs-compare"
+          mkdir -p "$compare_root/base" "$compare_root/head"
+          git archive "$baseline" | tar -x -C "$compare_root/base"
+          git archive "$HEAD_SHA" | tar -x -C "$compare_root/head"
+          {
+            echo "BASELINE_COMMIT=$baseline"
+            echo "HEAD_COMMIT=$HEAD_SHA"
+            echo "COMPARE_ROOT=$compare_root"
+          } >> "$GITHUB_ENV"
+      - name: Scan trusted base and HEAD in one database snapshot
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.COMPARE_ROOT }}
+          scanners: vuln
+          format: json
+          output: trivy-fs-combined.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache: "false"
+          version: v0.69.3
+      - name: Split and validate trusted comparison evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for side in base head; do
+            jq --arg side "$side" '
+              .ArtifactName = $side
+              | .Results = [
+                  .Results[]?
+                  | select((.Target // "") | test("(^|/)" + $side + "/"))
+                  | .Target |= sub("^(.*?/)?" + $side + "/"; "")
+                ]
+            ' trivy-fs-combined.json > "trivy-fs-$side.json"
+          done
+          base_targets="$(jq '[.Results[]?] | length' trivy-fs-base.json)"
+          head_targets="$(jq '[.Results[]?] | length' trivy-fs-head.json)"
+          if (( base_targets == 0 || head_targets == 0 )); then
+            echo "::error title=Trivy SCA SCANNER_ERROR::The single-snapshot scan did not produce evidence for both trusted base and HEAD."
+            exit 30
+          fi
+          if git diff --quiet "$BASELINE_COMMIT" "$HEAD_COMMIT" -- pom.xml; then
+            base_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-base.json)"
+            head_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-head.json)"
+            if [[ "$base_findings" != "$head_findings" ]]; then
+              echo "::error title=Trivy SCA SCANNER_ERROR::Dependency findings differ although pom.xml is unchanged; evidence is not trustworthy."
+              exit 30
+            fi
+          fi
+      - name: Convert complete HEAD evidence to SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy convert \
+            --format sarif \
+            --output trivy-fs-full.sarif \
+            trivy-fs-head.json
+          json_count="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs-head.json)"
+          sarif_count="$(jq '[.runs[]?.results[]?] | length' trivy-fs-full.sarif)"
+          if [[ "$json_count" != "$sarif_count" ]]; then
+            echo "::error title=Trivy SCA SCANNER_ERROR::JSON/SARIF evidence mismatch: JSON=$json_count SARIF=$sarif_count."
+            exit 30
+          fi
+      - name: Calculate and enforce dependency delta
+        shell: bash
+        env:
+          SUPPORT_CONTACT: ${{ inputs.support-contact }}
+        run: |
+          set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
+          if ! jq --slurpfile base trivy-fs-base.json '
+            ([ $base[0].Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion] | @json ]) as $known
+            | .Results |= map(
+                . as $result
+                | .Vulnerabilities = [
+                  (.Vulnerabilities // [])[]
+                  | .Target = $result.Target
+                  | select(([.VulnerabilityID, .PkgName, .InstalledVersion] | @json) as $key | ($known | index($key) | not))
+                ]
+              )
+          ' trivy-fs-head.json > trivy-fs-delta.json; then
+            echo "::error::SCANNER_ERROR: Trivy dependency evidence could not be compared."
+            exit 30
+          fi
+          total=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs-head.json)
+          findings=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs-delta.json)
+          inherited=$((total - findings))
+          decision=PASS
+          (( inherited > 0 )) && decision=WARN
+          (( findings > 0 )) && decision=BLOCK
+          exec 3>&1
+          {
+            echo "### Trivy filesystem delta — \`$decision\`"
+            echo
+            echo "- Introduced actionable findings: **$findings**"
+            echo "- Inherited findings visible but nonblocking: **$inherited**"
+            echo "- Comparison: \`$BASELINE_COMMIT..${{ github.event.pull_request.head.sha || github.sha }}\` using one Trivy database snapshot"
+            if (( findings > 0 )); then
+              echo
+              echo "| Target | Vulnerability | Package | Installed | Fixed | Severity | Description | Advisory |"
+              echo "|---|---|---|---|---|---|---|---|"
+              jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-fs-delta.json |
+                while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
+                  printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
+                  echo "::error file=$(command_escape "$target"),line=1,title=Trivy SCA $(command_escape "$id") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); dependencia=$(message_escape "$package")@$(message_escape "$installed"); corrección=$(message_escape "$fixed"). Motivo: vulnerabilidad High/Critical nueva con versión corregida disponible. Actualice la dependencia, regenere el lockfile y reejecute el PR. Advisory: $(message_escape "$advisory"). Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                done
+              echo
+              echo "**Motivo del bloqueo:** vulnerabilidad High/Critical nueva con una corrección publicada; requiere validación de alcance durante el canary."
+              echo "**Corrección:** actualice cada dependencia a la versión corregida indicada y regenere el lockfile."
+              echo "**Validación:** reejecute el PR y confirme que el fingerprint ya no aparece en el delta."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere evidencia, owner, control compensatorio y vencimiento en la rama protegida."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( findings > 0 )); then
+            echo "Security delta rejected: $findings finding(s) exist in HEAD but not in trusted base $BASELINE_COMMIT." >&2
+            exit 10
+          fi
+      - name: Preserve dependency evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-fs-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            trivy-fs-combined.json
+            trivy-fs-full.sarif
+            trivy-fs-base.json
+            trivy-fs-head.json
+            trivy-fs-delta.json
+          if-no-files-found: error
+          retention-days: 7
+
+  container:
+    name: container / trivy-image-delta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: guardrails
+    permissions:
+      contents: read
+    env:
+      IMAGE_NAME: ${{ inputs.image-name }}
+      SUPPORT_CONTACT: ${{ inputs.support-contact }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve trusted comparison commit
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          baseline="$HEAD_SHA"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            baseline="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            baseline="$PUSH_BEFORE_SHA"
+          fi
+          if [[ ! "$baseline" =~ ^[0-9a-f]{40}$ || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SCANNER_ERROR: trusted base/head SHA is unavailable. Retry from a complete pull_request or push event."
+            exit 30
+          fi
+          if ! git cat-file -e "$baseline^{commit}" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "::error::SCANNER_ERROR: trusted base/head commit is missing from the checkout."
+            exit 30
+          fi
+          baseline_root="$RUNNER_TEMP/trivy-image-base"
+          git worktree add --detach "$baseline_root" "$baseline"
+          echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
+          echo "BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+      - name: Build HEAD image
+        run: docker build --pull --tag "$IMAGE_NAME:head-${{ github.event.pull_request.head.sha || github.sha }}" .
+      - name: Build trusted base image
+        run: docker build --tag "$IMAGE_NAME:base-$BASELINE_COMMIT" "$BASELINE_ROOT"
+      - name: Report complete HEAD image findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          scan-ref: ${{ env.IMAGE_NAME }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scanners: vuln
+          format: sarif
+          output: trivy-image-full.sarif
+          severity: CRITICAL,HIGH
+          limit-severities-for-sarif: "true"
+          ignore-unfixed: true
+          exit-code: "0"
+          cache: "false"
+          version: v0.69.3
+      - name: Scan trusted base image with the same database
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          scan-type: image
+          scan-ref: ${{ env.IMAGE_NAME }}:base-${{ env.BASELINE_COMMIT }}
+          scanners: vuln
+          format: json
+          output: trivy-image-base.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache: "false"
+          skip-setup-trivy: "true"
+          version: v0.69.3
+      - name: Scan HEAD image with the same database
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          scan-type: image
+          scan-ref: ${{ env.IMAGE_NAME }}:head-${{ github.event.pull_request.head.sha || github.sha }}
+          scanners: vuln
+          format: json
+          output: trivy-image-head.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          cache: "false"
+          skip-setup-trivy: "true"
+          version: v0.69.3
+      - name: Calculate and enforce image delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          command_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            value="${value//':'/'%3A'}"; value="${value//','/'%2C'}"
+            printf '%s' "$value"
+          }
+          message_escape() {
+            local value="$1"
+            value="${value//'%'/'%25'}"; value="${value//$'\r'/'%0D'}"; value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
+          if ! jq --slurpfile base trivy-image-base.json '
+            ([ $base[0].Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion] | @json ]) as $known
+            | .Results |= map(
+                . as $result
+                | .Vulnerabilities = [
+                  (.Vulnerabilities // [])[]
+                  | .Target = $result.Target
+                  | select(([.VulnerabilityID, .PkgName, .InstalledVersion] | @json) as $key | ($known | index($key) | not))
+                ]
+              )
+          ' trivy-image-head.json > trivy-image-delta.json; then
+            echo "::error::SCANNER_ERROR: Trivy image evidence could not be compared."
+            exit 30
+          fi
+          total=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image-head.json)
+          findings=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image-delta.json)
+          inherited=$((total - findings))
+          decision=PASS
+          (( inherited > 0 )) && decision=WARN
+          (( findings > 0 )) && decision=BLOCK
+          exec 3>&1
+          {
+            echo "### Trivy image delta — \`$decision\`"
+            echo
+            echo "- Introduced actionable findings: **$findings**"
+            echo "- Inherited findings visible but nonblocking: **$inherited**"
+            echo "- Comparison: \`$BASELINE_COMMIT..${{ github.event.pull_request.head.sha || github.sha }}\` using one Trivy database snapshot"
+            if (( findings > 0 )); then
+              echo
+              echo "| Target/layer | Vulnerability | Package | Installed | Fixed | Severity | Description | Advisory |"
+              echo "|---|---|---|---|---|---|---|---|"
+              jq -r '.Results[]?.Vulnerabilities[]? | [.Target, .VulnerabilityID, .PkgName, .InstalledVersion, (.FixedVersion // "review advisory"), .Severity, (.Title // "No title supplied"), (.PrimaryURL // .References[0] // "unavailable")] | @tsv' trivy-image-delta.json |
+                while IFS=$'\t' read -r target id package installed fixed severity title advisory; do
+                  printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "${target//|/\\|}" "${id//|/\\|}" "${package//|/\\|}" "${installed//|/\\|}" "${fixed//|/\\|}" "${severity//|/\\|}" "${title//|/\\|}" "${advisory//|/\\|}"
+                  echo "::error title=Trivy container $(command_escape "$id") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); imagen=$(message_escape "$IMAGE_NAME"); target=$(message_escape "$target"); paquete=$(message_escape "$package")@$(message_escape "$installed"); corrección=$(message_escape "$fixed"). Actualice la imagen base o paquete, reconstruya y reejecute el PR. Advisory: $(message_escape "$advisory"). Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                done
+              echo
+              echo "**Motivo del bloqueo:** la imagen del PR introduce una vulnerabilidad High/Critical corregible que no existe en la imagen de la base confiable."
+              echo "**Corrección:** actualice la imagen base o el paquete a la versión corregida y reconstruya."
+              echo "**Validación:** reejecute el PR y confirme que el fingerprint desaparece del delta de imagen."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere evidencia, owner, control compensatorio y vencimiento."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( findings > 0 )); then
+            echo "Security delta rejected: $findings finding(s) exist in HEAD but not in trusted base $BASELINE_COMMIT." >&2
+            exit 10
+          fi
+      - name: Preserve image evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-image-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            trivy-image-full.sarif
+            trivy-image-base.json
+            trivy-image-head.json
+            trivy-image-delta.json
+          if-no-files-found: error
+          retention-days: 7
+
+  policy:
+    name: policy / decision
+    if: ${{ always() }}
+    needs: [secrets, semgrep, dependencies, container]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Enforce aggregate decision
+        shell: bash
+        env:
+          SECRETS_RESULT: ${{ needs.secrets.result }}
+          SAST_RESULT: ${{ needs.semgrep.result }}
+          SCA_RESULT: ${{ needs.dependencies.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+          SUPPORT_CONTACT: ${{ inputs.support-contact }}
+        run: |
+          set -euo pipefail
+          failed=0
+          {
+            echo "### SaleADS DevSecOps policy decision"
+            echo
+            echo "| Control | Resultado |"
+            echo "|---|---|"
+            echo "| secrets / gitleaks | $SECRETS_RESULT |"
+            echo "| sast / semgrep-delta | $SAST_RESULT |"
+            echo "| sca / trivy-filesystem-delta | $SCA_RESULT |"
+            echo "| container / trivy-image-delta | $CONTAINER_RESULT |"
+            echo
+            for result in "$SECRETS_RESULT" "$SAST_RESULT" "$SCA_RESULT" "$CONTAINER_RESULT"; do
+              [[ "$result" == "success" ]] || failed=1
+            done
+            if (( failed > 0 )); then
+              echo "**Decisión: BLOCK.** Uno o más controles bloquearon o no produjeron evidencia confiable."
+              echo
+              echo "**Corrección:** abra el resumen del control rojo, aplique la remediación indicada y reejecute el PR."
+              echo "**Validación:** los cuatro controles y este agregador deben finalizar en verde."
+              echo "**Ayuda/excepción:** $SUPPORT_CONTACT. No desactive el check; tramite una excepción temporal con evidencia, owner, control compensatorio y vencimiento."
+            else
+              echo "**Decisión: PASS.** Todos los controles ejecutaron y no existe un delta bloqueante."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( failed > 0 )); then
+            echo "::error title=SaleADS policy BLOCK::Uno o más controles fallaron o no generaron evidencia confiable. Revise el resumen del control rojo y contacte $SUPPORT_CONTACT si requiere triage."
+            exit 10
+          fi
