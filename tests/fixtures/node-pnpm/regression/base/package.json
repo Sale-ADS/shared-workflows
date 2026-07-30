@@ -1,0 +1,6 @@
+{
+  "name": "regression-node-fixture",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "dependencies": {}
+}
