@@ -1,0 +1,19 @@
+{
+  "ArtifactName": "head",
+  "Results": [
+    {
+      "Target": "pnpm-lock.yaml",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2021-23337",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "FixedVersion": "4.17.21",
+          "Severity": "HIGH",
+          "Title": "Command injection through template",
+          "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2021-23337"
+        }
+      ]
+    }
+  ]
+}

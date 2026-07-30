@@ -1,0 +1,16 @@
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: 4.17.20
+        version: 4.17.20
+
+packages:
+  lodash@4.17.20:
+    resolution:
+      integrity: sha512-fixture-only-not-a-real-integrity-value
+
+snapshots:
+  lodash@4.17.20: {}

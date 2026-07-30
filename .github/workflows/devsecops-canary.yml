@@ -12,11 +12,11 @@ name: SaleADS DevSecOps Canary
 #   • Do NOT pass `secrets: inherit`. This workflow needs no secrets and declares
 #     no `secrets:` block on purpose; grant the caller only `contents: read`.
 #
-# COVERAGE SCOPE (canary): SAST and SCA are tuned for Java/Maven repositories.
-#   • Semgrep enforces a single Java rule (CWE-78) and the SCA consistency guard
-#     keys on `pom.xml`. On non-Java/Maven consumers these two controls PASS
-#     without evaluating anything — broaden the ruleset and the guard before
-#     onboarding such a service, or the green check is misleading.
+# COVERAGE SCOPE (canary):
+#   • `java-maven` is the default and preserves the original consumer contract.
+#   • `node-pnpm` is opt-in. It validates pnpm lock/workspace evidence, enables
+#     the reviewed TypeScript/JavaScript policy, and requires an existing
+#     repository-relative container Dockerfile and build context.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -25,6 +25,21 @@ on:
       image-name:
         description: Local image name used for the container scan
         required: true
+        type: string
+      security-profile:
+        description: Security coverage profile (java-maven or node-pnpm)
+        required: false
+        default: java-maven
+        type: string
+      dockerfile-path:
+        description: Repository-relative Dockerfile used for HEAD and trusted-base image builds
+        required: false
+        default: Dockerfile
+        type: string
+      build-context:
+        description: Repository-relative Docker build context used for HEAD and trusted-base image builds
+        required: false
+        default: .
         type: string
       support-contact:
         description: Owner or support channel shown in blocking messages
@@ -45,6 +60,7 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SECURITY_PROFILE: ${{ inputs.security-profile }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
@@ -53,7 +69,17 @@ jobs:
               exit 1
               ;;
           esac
-          echo "Caller context '$EVENT_NAME' accepted." >> "$GITHUB_STEP_SUMMARY"
+          case "$SECURITY_PROFILE" in
+            java-maven|node-pnpm) ;;
+            *)
+              echo "::error title=DevSecOps POLICY_ERROR::Unsupported security-profile '$SECURITY_PROFILE'. Use 'java-maven' or 'node-pnpm'."
+              exit 31
+              ;;
+          esac
+          {
+            echo "Caller context '$EVENT_NAME' accepted."
+            echo "Security profile '$SECURITY_PROFILE' accepted."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   secrets:
     name: secrets / gitleaks
@@ -392,6 +418,8 @@ jobs:
       image: semgrep/semgrep@sha256:bdf7013b2c3634a487671158da77c554f531742326b543a9464d2adf6c433ac8 # 1.171.0
     permissions:
       contents: read
+    env:
+      SECURITY_PROFILE: ${{ inputs.security-profile }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -461,6 +489,47 @@ jobs:
                         - pattern: execSync($SINK, ...)
                     - focus-metavariable: $SINK
           YAML
+          if [[ "$SECURITY_PROFILE" == "node-pnpm" ]]; then
+            cat >> /tmp/semgrep-saleads-policy.yml <<'YAML'
+            - id: saleads-node-dangerous-code-evaluation
+              message: Untrusted HTTP input reaches dynamic JavaScript code evaluation.
+              languages: [js, ts]
+              severity: ERROR
+              mode: taint
+              metadata:
+                category: security
+                cwe: CWE-95
+                source: Express/Nest request property
+                sink: eval or Function constructor
+                remediation: Remove dynamic code evaluation; parse the input as data and dispatch through an allowlist of fixed operations.
+              pattern-sources:
+                - pattern-either:
+                    - pattern: $REQ.query
+                    - pattern: $REQ.body
+                    - pattern: $REQ.params
+              pattern-sinks:
+                - patterns:
+                    - pattern-either:
+                        - pattern: eval($SINK)
+                        - pattern: Function($SINK)
+                        - pattern: new Function($SINK)
+                    - focus-metavariable: $SINK
+            - id: saleads-node-disabled-tls-verification
+              message: TLS certificate verification is disabled for an HTTPS client.
+              languages: [js, ts]
+              severity: ERROR
+              metadata:
+                category: security
+                cwe: CWE-295
+                remediation: Remove rejectUnauthorized:false and trust the approved CA bundle instead of disabling certificate verification.
+              patterns:
+                - pattern-inside: |
+                    {
+                      ...
+                    }
+                - pattern: "rejectUnauthorized: false"
+          YAML
+          fi
       - name: Validate pinned Semgrep engine and policy
         shell: bash
         run: |
@@ -504,6 +573,24 @@ jobs:
           if [[ "$node_findings" != "1" ]]; then
             echo "::error title=Semgrep SCANNER_ERROR::Pinned policy self-test expected one Node command-injection finding, received $node_findings."
             exit 30
+          fi
+          if [[ "$SECURITY_PROFILE" == "node-pnpm" ]]; then
+            cat > /tmp/semgrep-policy-self-test-node-profile.ts <<'TS'
+          export function unsafeEval(req: any): unknown {
+            return eval(req.body.code);
+          }
+          export const unsafeAgent = { rejectUnauthorized: false };
+          TS
+            semgrep scan \
+              --config /tmp/semgrep-saleads-policy.yml \
+              --json \
+              --output /tmp/semgrep-policy-self-test-node-profile.json \
+              /tmp/semgrep-policy-self-test-node-profile.ts
+            profile_findings="$(jq '[.results[]? | select(.check_id | test("saleads-node-(dangerous-code-evaluation|disabled-tls-verification)$"))] | length' /tmp/semgrep-policy-self-test-node-profile.json)"
+            if [[ "$profile_findings" != "2" ]]; then
+              echo "::error title=Semgrep SCANNER_ERROR::Pinned node-pnpm policy self-test expected two reviewed findings, received $profile_findings."
+              exit 30
+            fi
           fi
       - name: Resolve trusted comparison commit
         shell: bash
@@ -584,8 +671,8 @@ jobs:
             echo "- Comparación: \`$BASELINE_COMMIT..${{ github.event.pull_request.head.sha || github.sha }}\`"
             if (( introduced > 0 )); then
               echo
-              echo "| Regla | Archivo | Línea | Severidad | CWE | Motivo |"
-              echo "|---|---|---:|---|---|---|"
+              echo "| Regla | Archivo | Línea | Severidad | CWE | Motivo | Corrección |"
+              echo "|---|---|---:|---|---|---|---|"
               jq -r '
                 .runs[] as $run
                 | $run.results[]? as $result
@@ -594,19 +681,36 @@ jobs:
                     ($result.locations[0].physicalLocation.artifactLocation.uri // "unknown"),
                     ($result.locations[0].physicalLocation.region.startLine // 1),
                     ($result.level // "error"),
-                    ([$run.tool.driver.rules[]? | select(.id == $result.ruleId) | .properties.cwe][0] // "review"),
+                    ([$run.tool.driver.rules[]? | select(.id == $result.ruleId) | .properties.tags[]? | select(startswith("CWE-"))][0] // "review"),
                     ($result.message.text // "Security rule matched")
                   ]
                 | @tsv
               ' semgrep-delta.sarif |
                 while IFS=$'\t' read -r rule file line severity cwe message; do
-                  printf '| %s | %s | %s | %s | %s | %s |\n' "$rule" "$file" "$line" "$severity" "$cwe" "${message//|/\\|}"
-                  echo "::error file=$(command_escape "$file"),line=$line,title=Semgrep $(command_escape "$rule") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); $(message_escape "$message") Corrección: no envíe entrada JAX-RS a comandos del sistema; use un allowlist de operaciones fijas. Validación: elimine el flujo y reejecute el PR. Ayuda/excepción: $SUPPORT_CONTACT." >&3
+                  case "$rule" in
+                    *saleads-java-command-injection)
+                      remediation="Map an allowlisted operation to fixed executable and argument values; never pass JAX-RS input to the operating system."
+                      ;;
+                    *saleads-node-command-injection)
+                      remediation="Use execFile/spawn with a fixed executable and allowlisted argument values; never build a shell command from request input."
+                      ;;
+                    *saleads-node-dangerous-code-evaluation)
+                      remediation="Remove eval/Function; parse the input as data and dispatch through an allowlist of fixed operations."
+                      ;;
+                    *saleads-node-disabled-tls-verification)
+                      remediation="Remove rejectUnauthorized:false and configure the approved CA bundle."
+                      ;;
+                    *)
+                      remediation="Remove the unsafe data flow described by the rule and add a regression test."
+                      ;;
+                  esac
+                  printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$rule" "$file" "$line" "$severity" "$cwe" "${message//|/\\|}" "${remediation//|/\\|}"
+                  echo "::error file=$(command_escape "$file"),line=$line,title=Semgrep $(command_escape "$rule") BLOCK::Estado=nuevo; severidad=$(message_escape "$severity"); CWE=$(message_escape "$cwe"); motivo=$(message_escape "$message"); corrección=$(message_escape "$remediation"); validación=elimine el flujo inseguro, agregue una prueba negativa y reejecute el PR; ayuda/excepción=$SUPPORT_CONTACT." >&3
                 done
               echo
-              echo "**Motivo del bloqueo:** una entrada HTTP alcanzable fluye hacia ejecución de comandos del sistema (CWE-78)."
-              echo "**Corrección:** traduzca un identificador permitido a ejecutable y argumentos constantes; nunca pase entrada de la solicitud al sistema operativo."
-              echo "**Validación:** elimine el flujo, agregue una prueba negativa y reejecute este PR."
+              echo "**Motivo del bloqueo:** el PR introdujo uno o más flujos TS/JS o Java que coinciden con una regla de seguridad revisada."
+              echo "**Corrección:** aplique la remediación específica indicada en la tabla y la anotación del archivo."
+              echo "**Validación:** elimine el flujo inseguro, agregue una prueba negativa y reejecute este PR."
               echo "**Ayuda/excepción:** $SUPPORT_CONTACT. Una excepción requiere fingerprint, evidencia, owner, control compensatorio y vencimiento en la rama protegida."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -625,6 +729,7 @@ jobs:
             /tmp/semgrep-saleads-policy.yml
             /tmp/semgrep-policy-self-test.json
             /tmp/semgrep-policy-self-test-node.json
+            /tmp/semgrep-policy-self-test-node-profile.json
           if-no-files-found: error
           retention-days: 7
 
@@ -635,6 +740,8 @@ jobs:
     needs: guardrails
     permissions:
       contents: read
+    env:
+      SECURITY_PROFILE: ${{ inputs.security-profile }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -674,6 +781,72 @@ jobs:
             echo "HEAD_COMMIT=$HEAD_SHA"
             echo "COMPARE_ROOT=$compare_root"
           } >> "$GITHUB_ENV"
+      - name: Validate dependency profile evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$SECURITY_PROFILE" != "node-pnpm" ]]; then
+            exit 0
+          fi
+
+          policy_error() {
+            echo "::error title=Trivy SCA POLICY_ERROR::${1}"
+            exit 31
+          }
+
+          for side in base head; do
+            root="$COMPARE_ROOT/$side"
+            [[ -f "$root/pnpm-lock.yaml" && ! -L "$root/pnpm-lock.yaml" ]] ||
+              policy_error "The node-pnpm profile requires a regular repository-root pnpm-lock.yaml in trusted base and HEAD."
+            [[ -f "$root/package.json" && ! -L "$root/package.json" ]] ||
+              policy_error "The node-pnpm profile requires a regular repository-root package.json in trusted base and HEAD."
+            if find "$root" -path '*/node_modules' -prune -o -type l \( -name package.json -o -name pnpm-lock.yaml -o -name pnpm-workspace.yaml \) -print -quit | grep -q .; then
+              policy_error "Dependency manifests and pnpm workspace files must not be symbolic links."
+            fi
+
+            material="$RUNNER_TEMP/pnpm-${side}-dependency-material.jsonl"
+            : > "$material"
+            while IFS= read -r -d '' manifest; do
+              relative="${manifest#"$root/"}"
+              if ! jq -cS --arg path "$relative" '{
+                path: $path,
+                dependencies: (.dependencies // {}),
+                devDependencies: (.devDependencies // {}),
+                optionalDependencies: (.optionalDependencies // {}),
+                peerDependencies: (.peerDependencies // {}),
+                pnpm: (.pnpm // {})
+              }' "$manifest" >> "$material"; then
+                policy_error "A package.json in $side evidence is invalid JSON. Fix the manifest and rerun the PR."
+              fi
+            done < <(
+              find "$root" -path '*/node_modules' -prune -o -type f -name package.json -print0 |
+                python3 -c 'import sys; paths=sys.stdin.buffer.read().split(b"\0"); sys.stdout.buffer.write(b"\0".join(sorted(p for p in paths if p)) + b"\0")'
+            )
+            if [[ -f "$root/pnpm-workspace.yaml" ]]; then
+              printf '{"path":"pnpm-workspace.yaml","sha256":"%s"}\n' \
+                "$(sha256sum "$root/pnpm-workspace.yaml" | cut -d' ' -f1)" >> "$material"
+            fi
+            sort -o "$material" "$material"
+          done
+
+          lock_changed=0
+          workspace_changed=0
+          declarations_changed=0
+          cmp -s "$COMPARE_ROOT/base/pnpm-lock.yaml" "$COMPARE_ROOT/head/pnpm-lock.yaml" || lock_changed=1
+          if [[ -f "$COMPARE_ROOT/base/pnpm-workspace.yaml" || -f "$COMPARE_ROOT/head/pnpm-workspace.yaml" ]]; then
+            cmp -s "$COMPARE_ROOT/base/pnpm-workspace.yaml" "$COMPARE_ROOT/head/pnpm-workspace.yaml" || workspace_changed=1
+          fi
+          cmp -s "$RUNNER_TEMP/pnpm-base-dependency-material.jsonl" "$RUNNER_TEMP/pnpm-head-dependency-material.jsonl" ||
+            declarations_changed=1
+
+          if (( declarations_changed > 0 && lock_changed == 0 )); then
+            policy_error "A workspace dependency declaration changed without pnpm-lock.yaml. Run pnpm install, review the lockfile, and commit it."
+          fi
+          {
+            echo "PNPM_LOCK_CHANGED=$lock_changed"
+            echo "PNPM_WORKSPACE_CHANGED=$workspace_changed"
+            echo "PNPM_DECLARATIONS_CHANGED=$declarations_changed"
+          } >> "$GITHUB_ENV"
       - name: Scan trusted base and HEAD in one database snapshot
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -707,11 +880,30 @@ jobs:
             echo "::error title=Trivy SCA SCANNER_ERROR::The single-snapshot scan did not produce evidence for both trusted base and HEAD."
             exit 30
           fi
-          if git diff --quiet "$BASELINE_COMMIT" "$HEAD_COMMIT" -- pom.xml; then
+          if [[ "$SECURITY_PROFILE" == "node-pnpm" ]]; then
+            for side in base head; do
+              lock_targets="$(jq '[.Results[]? | select((.Target // "") | endswith("pnpm-lock.yaml"))] | length' "trivy-fs-$side.json")"
+              if (( lock_targets == 0 )); then
+                echo "::error title=Trivy SCA POLICY_ERROR::The node-pnpm profile did not produce pnpm-lock.yaml evidence for $side. Validate the lockfile syntax and workspace layout."
+                exit 31
+              fi
+            done
+          fi
+          dependency_material_unchanged=false
+          if [[ "$SECURITY_PROFILE" == "java-maven" ]] &&
+             git diff --quiet "$BASELINE_COMMIT" "$HEAD_COMMIT" -- pom.xml; then
+            dependency_material_unchanged=true
+          elif [[ "$SECURITY_PROFILE" == "node-pnpm" &&
+                  "${PNPM_LOCK_CHANGED:-0}" == "0" &&
+                  "${PNPM_WORKSPACE_CHANGED:-0}" == "0" &&
+                  "${PNPM_DECLARATIONS_CHANGED:-0}" == "0" ]]; then
+            dependency_material_unchanged=true
+          fi
+          if [[ "$dependency_material_unchanged" == "true" ]]; then
             base_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-base.json)"
             head_findings="$(jq -S '[.Results[]?.Vulnerabilities[]? | [.VulnerabilityID, .PkgName, .InstalledVersion]] | unique' trivy-fs-head.json)"
             if [[ "$base_findings" != "$head_findings" ]]; then
-              echo "::error title=Trivy SCA SCANNER_ERROR::Dependency findings differ although pom.xml is unchanged; evidence is not trustworthy."
+              echo "::error title=Trivy SCA SCANNER_ERROR::Dependency findings differ although the $SECURITY_PROFILE dependency material is unchanged; evidence is not trustworthy."
               exit 30
             fi
           fi
@@ -817,6 +1009,9 @@ jobs:
     env:
       IMAGE_NAME: ${{ inputs.image-name }}
       SUPPORT_CONTACT: ${{ inputs.support-contact }}
+      SECURITY_PROFILE: ${{ inputs.security-profile }}
+      DOCKERFILE_PATH: ${{ inputs.dockerfile-path }}
+      BUILD_CONTEXT: ${{ inputs.build-context }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -851,10 +1046,62 @@ jobs:
           git worktree add --detach "$baseline_root" "$baseline"
           echo "BASELINE_COMMIT=$baseline" >> "$GITHUB_ENV"
           echo "BASELINE_ROOT=$baseline_root" >> "$GITHUB_ENV"
+      - name: Validate container target contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy_error() {
+            echo "::error title=Container POLICY_ERROR::${1}"
+            exit 31
+          }
+          validate_relative_input() {
+            local name="$1" value="$2"
+            [[ -n "$value" && "$value" != /* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] ||
+              policy_error "$name must be a non-empty repository-relative path."
+            [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+              policy_error "$name contains unsupported characters; use letters, digits, dot, underscore, slash or hyphen."
+            local segment
+            IFS='/' read -ra segments <<< "$value"
+            for segment in "${segments[@]}"; do
+              [[ "$segment" != ".." ]] || policy_error "$name must not traverse outside the repository."
+            done
+          }
+          resolve_path() {
+            python3 -c 'import os, sys; print(os.path.realpath(os.path.join(sys.argv[1], sys.argv[2])))' "$1" "$2"
+          }
+
+          validate_relative_input dockerfile-path "$DOCKERFILE_PATH"
+          validate_relative_input build-context "$BUILD_CONTEXT"
+
+          head_dockerfile="$(resolve_path "$GITHUB_WORKSPACE" "$DOCKERFILE_PATH")"
+          head_context="$(resolve_path "$GITHUB_WORKSPACE" "$BUILD_CONTEXT")"
+          base_dockerfile="$(resolve_path "$BASELINE_ROOT" "$DOCKERFILE_PATH")"
+          base_context="$(resolve_path "$BASELINE_ROOT" "$BUILD_CONTEXT")"
+          for resolved in "$head_dockerfile" "$head_context"; do
+            [[ "$resolved" == "$GITHUB_WORKSPACE" || "$resolved" == "$GITHUB_WORKSPACE/"* ]] ||
+              policy_error "Container target resolves outside the HEAD checkout."
+          done
+          for resolved in "$base_dockerfile" "$base_context"; do
+            [[ "$resolved" == "$BASELINE_ROOT" || "$resolved" == "$BASELINE_ROOT/"* ]] ||
+              policy_error "Container target resolves outside the trusted-base checkout."
+          done
+
+          if [[ "$SECURITY_PROFILE" == "node-pnpm" ]]; then
+            [[ -f "$head_dockerfile" && -d "$head_context" ]] ||
+              policy_error "node-pnpm HEAD target does not exist: dockerfile-path='$DOCKERFILE_PATH', build-context='$BUILD_CONTEXT'. Configure both caller inputs explicitly."
+            [[ -f "$base_dockerfile" && -d "$base_context" ]] ||
+              policy_error "node-pnpm trusted-base target does not exist: dockerfile-path='$DOCKERFILE_PATH', build-context='$BUILD_CONTEXT'. Establish the target before enabling the profile."
+          fi
+          {
+            echo "HEAD_DOCKERFILE=$head_dockerfile"
+            echo "HEAD_BUILD_CONTEXT=$head_context"
+            echo "BASE_DOCKERFILE=$base_dockerfile"
+            echo "BASE_BUILD_CONTEXT=$base_context"
+          } >> "$GITHUB_ENV"
       - name: Build HEAD image
-        run: docker build --pull --tag "$IMAGE_NAME:head-${{ github.event.pull_request.head.sha || github.sha }}" .
+        run: docker build --pull --file "$HEAD_DOCKERFILE" --tag "$IMAGE_NAME:head-${{ github.event.pull_request.head.sha || github.sha }}" "$HEAD_BUILD_CONTEXT"
       - name: Build trusted base image
-        run: docker build --tag "$IMAGE_NAME:base-$BASELINE_COMMIT" "$BASELINE_ROOT"
+        run: docker build --file "$BASE_DOCKERFILE" --tag "$IMAGE_NAME:base-$BASELINE_COMMIT" "$BASE_BUILD_CONTEXT"
       - name: Report complete HEAD image findings
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
